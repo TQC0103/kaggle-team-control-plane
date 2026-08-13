@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "kaggle-team-control-plane": {
+      "command": "python",
+      "args": ["-m", "agent_interface", "serve"],
+      "env": {
+        "KAGGLE_TEAM_API_URL": "http://127.0.0.1:8765"
+      }
+    }
+  }
+}

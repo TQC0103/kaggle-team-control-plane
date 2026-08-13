@@ -1,0 +1,13 @@
+{
+  "id": "replace-me/kcp-smoke-test",
+  "title": "KCP smoke test",
+  "code_file": "main.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": false,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}
