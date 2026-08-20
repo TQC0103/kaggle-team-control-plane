@@ -42,6 +42,9 @@ yarn-error.log*
 /build/desktop/
 /build/desktop-cli/
 
+# generated Kaggle workload bundles (source snapshots, datasets, and revisions)
+/experiments/qasper-v0-5-dev-*/
+
 # local control-plane state and fetched artifacts
 /data/
 /artifacts/

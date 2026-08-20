@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ class JobScheduler:
         max_workers: int = 10,
         max_jobs_per_account: int = 2,
         remote_poll_seconds: float = 5.0,
+        live_log_poll_seconds: float = 30.0,
         dispatch_poll_seconds: float = 0.1,
         max_source_bytes: int = DEFAULT_MAX_SOURCE_BYTES,
         quota_sync_seconds: float = 300.0,
@@ -43,6 +45,7 @@ class JobScheduler:
         self.max_workers = max(1, max_workers)
         self.max_jobs_per_account = max(1, max_jobs_per_account)
         self.remote_poll_seconds = max(0.001, remote_poll_seconds)
+        self.live_log_poll_seconds = max(0.001, live_log_poll_seconds)
         self.dispatch_poll_seconds = max(0.001, dispatch_poll_seconds)
         self.max_source_bytes = max(1, max_source_bytes)
         self.quota_sync_seconds = max(30.0, quota_sync_seconds)
@@ -336,6 +339,52 @@ class JobScheduler:
 
             seen_running = False
             last_remote_state: str | None = None
+            remote_log_snapshot: list[str] = []
+            next_live_log_poll = 0.0
+            live_log_error_reported = False
+
+            def sync_live_output() -> None:
+                nonlocal remote_log_snapshot, live_log_error_reported
+                try:
+                    raw_log = self.adapter.logs(staged_job, env, cancel_event)
+                    safe_log = self._redact(raw_log, env)
+                    current_lines = [line[:2000] for line in safe_log.splitlines()]
+                    if len(current_lines) > 5000:
+                        current_lines = current_lines[-5000:]
+                    if current_lines[: len(remote_log_snapshot)] == remote_log_snapshot:
+                        new_lines = current_lines[len(remote_log_snapshot) :]
+                        reset = False
+                    elif current_lines == remote_log_snapshot:
+                        new_lines = []
+                        reset = False
+                    else:
+                        new_lines = current_lines[-200:]
+                        reset = bool(remote_log_snapshot)
+                    remote_log_snapshot = current_lines
+                    if new_lines:
+                        dropped = max(0, len(new_lines) - 200)
+                        self.database.append_job_event(
+                            job_id,
+                            "Synced live Kaggle output",
+                            details={
+                                "lines": new_lines[-200:],
+                                "dropped_lines": dropped,
+                                "remote_log_reset": reset,
+                            },
+                        )
+                    live_log_error_reported = False
+                except LocalCommandCancelled:
+                    raise
+                except Exception as exc:
+                    if not live_log_error_reported:
+                        self.database.append_job_event(
+                            job_id,
+                            "Could not sync live Kaggle output; monitoring continues",
+                            details={"error": self._redact(str(exc), env)[:2000]},
+                            level="warning",
+                        )
+                        live_log_error_reported = True
+
             while not cancel_event.is_set():
                 remote = self.adapter.status(staged_job, env, cancel_event)
                 safe_detail = self._redact(remote.detail, env)
@@ -347,6 +396,12 @@ class JobScheduler:
                         level="error" if remote.state == "failed" else "info",
                     )
                     last_remote_state = remote.state
+                if (
+                    remote.state in {"complete", "failed", "cancelled"}
+                    or time.monotonic() >= next_live_log_poll
+                ):
+                    next_live_log_poll = time.monotonic() + self.live_log_poll_seconds
+                    sync_live_output()
                 if remote.state == "complete":
                     output_result = self._redact(
                         self.adapter.output(staged_job, env, cancel_event), env
@@ -374,13 +429,40 @@ class JobScheduler:
                         raise LocalCommandCancelled("local monitor stop requested")
                     return
                 if remote.state == "failed":
+                    failure_output = None
+                    try:
+                        raw_failure_output = self.adapter.diagnostics(
+                            staged_job, env, cancel_event
+                        )
+                        self._redact_downloaded_text_files(raw_failure_output, env)
+                        failure_output = self._redact(raw_failure_output, env)
+                        self.database.append_job_event(
+                            job_id,
+                            "Downloaded failed Kaggle kernel diagnostics",
+                            details={
+                                "output_dir": failure_output.get("output_dir"),
+                                "file_count": len(failure_output.get("files", [])),
+                            },
+                        )
+                    except LocalCommandCancelled:
+                        raise
+                    except Exception as exc:
+                        self.database.append_job_event(
+                            job_id,
+                            "Could not download failed Kaggle kernel diagnostics",
+                            details={"error": self._redact(str(exc), env)},
+                            level="warning",
+                        )
+                    result = {"submit": submit_result}
+                    if failure_output is not None:
+                        result["failure_output"] = failure_output
                     changed = self.database.transition_job(
                         job_id,
                         {"submitted", "running"},
                         "failed",
                         fields={
                             "error": safe_detail or "Kaggle reported failure",
-                            "result": {"submit": submit_result},
+                            "result": result,
                         },
                     )
                     if not changed and self.database.get_job(job_id)["status"] == "cancel_requested":
@@ -453,6 +535,41 @@ class JobScheduler:
                         "result": {"submit": submit_result} if submit_result else None,
                     },
                 )
+
+    @staticmethod
+    def _redact_downloaded_text_files(
+        output_result: dict[str, Any], env: dict[str, str] | None
+    ) -> None:
+        output_dir_value = output_result.get("output_dir")
+        files = output_result.get("files")
+        if not isinstance(output_dir_value, str) or not isinstance(files, list):
+            return
+        output_dir = Path(output_dir_value).resolve()
+        secrets = [
+            env[key]
+            for key in ("KAGGLE_API_TOKEN", "KAGGLE_KEY")
+            if env and env.get(key)
+        ]
+        text_suffixes = {
+            ".log", ".txt", ".json", ".jsonl", ".csv", ".md", ".yaml", ".yml"
+        }
+        for relative in files[:1000]:
+            if not isinstance(relative, str):
+                continue
+            path = (output_dir / relative).resolve()
+            if (
+                not path.is_relative_to(output_dir)
+                or not path.is_file()
+                or path.suffix.casefold() not in text_suffixes
+                or path.stat().st_size > 16 * 1024 * 1024
+            ):
+                continue
+            content = path.read_text(encoding="utf-8", errors="replace")
+            for secret in secrets:
+                content = content.replace(secret, "[REDACTED]")
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(content, encoding="utf-8", newline="\n")
+            temporary.replace(path)
 
     @staticmethod
     def _redact(value: Any, env: dict[str, str] | None) -> Any:

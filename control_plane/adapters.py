@@ -24,6 +24,57 @@ KAGGLE_KERNEL_URL_PATTERN = re.compile(
 )
 DEFAULT_MAX_SOURCE_BYTES = 100 * 1024 * 1024
 DEFAULT_MAX_SOURCE_FILES = 10_000
+DEFAULT_GPU_MACHINE_SHAPE = "NvidiaTeslaT4"
+DEFAULT_TPU_MACHINE_SHAPE = "TpuV38"
+RUNTIME_MANIFEST_FIELDS = {
+    "accelerate",
+    "cuda_capability",
+    "cuda_device",
+    "cuda_runtime",
+    "pydantic",
+    "python",
+    "resolved_requirements_sha256",
+    "sentence_transformers",
+    "torch",
+    "transformers",
+}
+
+
+def hidden_subprocess_kwargs(platform_name: str | None = None) -> dict[str, Any]:
+    """Keep child CLIs invisible in the packaged Windows desktop app."""
+    if (platform_name or os.name) != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
+
+
+def read_runtime_manifest(output_dir: str | Path) -> dict[str, Any] | None:
+    """Read a bounded, allow-listed runtime.json from downloaded job output."""
+    root = Path(output_dir).resolve()
+    for candidate in sorted(root.rglob("runtime.json")):
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(root) or not resolved.is_file():
+            continue
+        if resolved.stat().st_size > 64 * 1024:
+            continue
+        try:
+            payload = json.loads(resolved.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        return {
+            key: value
+            for key, value in payload.items()
+            if key in RUNTIME_MANIFEST_FIELDS
+            and isinstance(value, (str, int, float, bool, list))
+        }
+    return None
 
 
 class AdapterError(RuntimeError):
@@ -50,6 +101,14 @@ class KaggleAdapter(Protocol):
     ) -> RemoteStatus: ...
 
     def output(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> dict[str, Any]: ...
+
+    def logs(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> str: ...
+
+    def diagnostics(
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> dict[str, Any]: ...
 
@@ -144,14 +203,15 @@ def stage_job_source(
     metadata["title"] = expected_id.split("/", 1)[1]
     metadata["code_file"] = code_files[0].name
     accelerator = str(job.get("metadata", {}).get("accelerator", "auto"))
+    machine_shape = str(job.get("metadata", {}).get("machine_shape", ""))
     if accelerator == "gpu":
         metadata["enable_gpu"] = True
         metadata["enable_tpu"] = False
-        metadata["machine_shape"] = "NvidiaTeslaT4"
+        metadata["machine_shape"] = machine_shape or DEFAULT_GPU_MACHINE_SHAPE
     elif accelerator == "tpu":
         metadata["enable_gpu"] = False
         metadata["enable_tpu"] = True
-        metadata["machine_shape"] = "TpuV38"
+        metadata["machine_shape"] = machine_shape or DEFAULT_TPU_MACHINE_SHAPE
     elif accelerator == "cpu":
         metadata["enable_gpu"] = False
         metadata["enable_tpu"] = False
@@ -176,9 +236,15 @@ def stage_job_source(
 
 
 class KaggleCliAdapter:
-    def __init__(self, executable: str | None = None, command_poll_seconds: float = 0.1):
+    def __init__(
+        self,
+        executable: str | None = None,
+        command_poll_seconds: float = 0.1,
+        live_log_capture_seconds: float = 3.0,
+    ):
         self.executable = executable or os.environ.get("KCP_KAGGLE_EXECUTABLE", "kaggle")
         self.command_poll_seconds = command_poll_seconds
+        self.live_log_capture_seconds = max(0.1, live_log_capture_seconds)
 
     def _run(
         self,
@@ -193,16 +259,20 @@ class KaggleCliAdapter:
         with tempfile.TemporaryFile(
             mode="w+", encoding="utf-8", errors="replace"
         ) as output_file:
+            command_env = dict(env)
+            command_env["PYTHONIOENCODING"] = "utf-8"
+            command_env["PYTHONUTF8"] = "1"
             try:
                 process = subprocess.Popen(
                     [self.executable, *args],
-                    env=env,
+                    env=command_env,
                     stdout=output_file,
                     stderr=subprocess.STDOUT,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                     shell=False,
+                    **hidden_subprocess_kwargs(),
                 )
             except OSError as exc:
                 raise AdapterError(f"could not start Kaggle CLI: {exc}") from exc
@@ -222,11 +292,80 @@ class KaggleCliAdapter:
                 )
             return output
 
+    def _run_follow_snapshot(
+        self,
+        args: list[str],
+        env: dict[str, str],
+        cancel_event: threading.Event,
+    ) -> str:
+        """Capture a bounded snapshot from Kaggle's live SSE log stream.
+
+        The non-following CLI command reads only the persisted log blob, which
+        remains empty while a kernel is running. ``--follow`` exposes the live
+        stream and replays it from the beginning on each connection. We keep
+        the connection open briefly, then stop only our local CLI process; the
+        remote Kaggle kernel is unaffected.
+        """
+        if cancel_event.is_set():
+            raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
+        with tempfile.TemporaryFile(
+            mode="w+", encoding="utf-8", errors="replace"
+        ) as output_file:
+            command_env = dict(env)
+            command_env["PYTHONIOENCODING"] = "utf-8"
+            command_env["PYTHONUTF8"] = "1"
+            try:
+                process = subprocess.Popen(
+                    [self.executable, *args],
+                    env=command_env,
+                    stdout=output_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    shell=False,
+                    **hidden_subprocess_kwargs(),
+                )
+            except OSError as exc:
+                raise AdapterError(f"could not start Kaggle CLI: {exc}") from exc
+
+            deadline = time.monotonic() + self.live_log_capture_seconds
+            stopped_after_snapshot = False
+            while process.poll() is None and time.monotonic() < deadline:
+                remaining = max(0.0, deadline - time.monotonic())
+                if cancel_event.wait(min(self.command_poll_seconds, remaining)):
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
+            if process.poll() is None:
+                stopped_after_snapshot = True
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+
+            output_file.seek(0)
+            output = output_file.read().strip()
+            if not stopped_after_snapshot and process.returncode:
+                raise AdapterError(
+                    f"Kaggle CLI exited with {process.returncode}: {output[-2000:]}"
+                )
+            return output
+
     def submit(
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> dict[str, Any]:
+        args = ["kernels", "push", "-p", job["source_dir"]]
+        machine_shape = str(job.get("metadata", {}).get("machine_shape", ""))
+        if machine_shape:
+            args.extend(["--accelerator", machine_shape])
         output = self._run(
-            ["kernels", "push", "-p", job["source_dir"]], env, cancel_event
+            args, env, cancel_event
         )
         expected_owner, expected_slug = job["kernel_slug"].split("/", 1)
         match = KAGGLE_KERNEL_URL_PATTERN.search(output)
@@ -285,10 +424,39 @@ class KaggleCliAdapter:
             for path in output_dir.rglob("*")
             if path.is_file()
         ][:1000]
-        return {
+        result = {
             "output_dir": str(output_dir),
             "files": sorted(files),
             "cli_message": message[-2000:],
+        }
+        runtime = read_runtime_manifest(output_dir)
+        if runtime:
+            result["runtime"] = runtime
+        return result
+
+    def logs(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> str:
+        return self._run_follow_snapshot(
+            ["kernels", "logs", "--follow", job["kernel_slug"]], env, cancel_event
+        )
+
+    def diagnostics(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> dict[str, Any]:
+        output_dir = Path(job["output_dir"]).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        message = self._run(
+            ["kernels", "logs", job["kernel_slug"]], env, cancel_event
+        )
+        if not message:
+            raise AdapterError("Kaggle returned an empty kernel diagnostic log")
+        target = output_dir / f"{job['kernel_slug'].split('/', 1)[-1]}.log"
+        target.write_text(message + "\n", encoding="utf-8", newline="\n")
+        return {
+            "output_dir": str(output_dir),
+            "files": [target.name],
+            "cli_message": "Downloaded Kaggle kernel execution log",
         }
 
     def quota(
@@ -340,6 +508,7 @@ class FakeKaggleAdapter:
         self.poll_delay_seconds = poll_delay_seconds
         self._lock = threading.Lock()
         self._polls: dict[str, int] = {}
+        self._log_polls: dict[str, int] = {}
         self.max_in_flight = 0
         self._in_flight = 0
         self._active_remote_jobs: set[str] = set()
@@ -422,6 +591,21 @@ class FakeKaggleAdapter:
                 self._in_flight -= 1
         output_dir = Path(job["output_dir"]).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
+        if str(job["metadata"].get("fake_outcome", "complete")) == "failed":
+            log_path = output_dir / f"{job['kernel_slug'].split('/', 1)[-1]}.log"
+            log_path.write_text(
+                str(
+                    job["metadata"].get(
+                        "fake_remote_log", "Traceback: fake remote kernel failure"
+                    )
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "output_dir": str(output_dir),
+                "files": [log_path.name],
+                "cli_message": "Downloaded failed kernel diagnostics",
+            }
         payload = job["metadata"].get("fake_result", {"score": 0.5})
         result_path = output_dir / "fake-result.json"
         result_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
@@ -429,4 +613,39 @@ class FakeKaggleAdapter:
             "output_dir": str(output_dir),
             "files": [result_path.name],
             "fake_result": payload,
+        }
+
+    def logs(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> str:
+        if cancel_event.is_set():
+            raise LocalCommandCancelled("fake log sync cancelled")
+        configured = job["metadata"].get("fake_live_logs", "")
+        if not isinstance(configured, list):
+            return str(configured)
+        with self._lock:
+            count = self._log_polls.get(job["id"], 0) + 1
+            self._log_polls[job["id"]] = count
+        return "\n".join(str(line) for line in configured[:count])
+
+    def diagnostics(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> dict[str, Any]:
+        if cancel_event.is_set():
+            raise LocalCommandCancelled("fake diagnostics cancelled")
+        output_dir = Path(job["output_dir"]).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        log_path = output_dir / f"{job['kernel_slug'].split('/', 1)[-1]}.log"
+        log_path.write_text(
+            str(
+                job["metadata"].get(
+                    "fake_remote_log", "Traceback: fake remote kernel failure"
+                )
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "output_dir": str(output_dir),
+            "files": [log_path.name],
+            "cli_message": "Downloaded failed kernel diagnostics",
         }

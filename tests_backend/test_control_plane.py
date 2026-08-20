@@ -13,7 +13,13 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from control_plane.adapters import AdapterError, FakeKaggleAdapter, KaggleCliAdapter
+from control_plane.adapters import (
+    AdapterError,
+    FakeKaggleAdapter,
+    KaggleCliAdapter,
+    hidden_subprocess_kwargs,
+    read_runtime_manifest,
+)
 from control_plane.api import create_server
 from control_plane.credentials import EnvCredentialVault
 from control_plane.errors import ConflictError, ValidationError
@@ -75,6 +81,133 @@ def wait_for_status(
 
 
 class KaggleCliAdapterTests(unittest.TestCase):
+    def test_runtime_manifest_is_bounded_and_allow_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "nested" / "runtime.json"
+            runtime.parent.mkdir()
+            runtime.write_text(
+                json.dumps(
+                    {
+                        "python": "3.12.13",
+                        "torch": "2.10.0+cu128",
+                        "cuda_device": "Tesla T4",
+                        "cuda_runtime": "12.8",
+                        "secret": "must-not-leave-the-artifact",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = read_runtime_manifest(root)
+        self.assertEqual(
+            result,
+            {
+                "python": "3.12.13",
+                "torch": "2.10.0+cu128",
+                "cuda_device": "Tesla T4",
+                "cuda_runtime": "12.8",
+            },
+        )
+
+    @patch("control_plane.adapters.subprocess.STARTUPINFO")
+    def test_windows_child_processes_are_hidden(self, startupinfo_factory) -> None:
+        startupinfo = startupinfo_factory.return_value
+        startupinfo.dwFlags = 0
+        with patch("control_plane.adapters.subprocess.STARTF_USESHOWWINDOW", 1), patch(
+            "control_plane.adapters.subprocess.SW_HIDE", 0
+        ), patch("control_plane.adapters.subprocess.CREATE_NO_WINDOW", 0x08000000):
+            options = hidden_subprocess_kwargs("nt")
+        self.assertEqual(options["creationflags"], 0x08000000)
+        self.assertEqual(startupinfo.dwFlags, 1)
+        self.assertEqual(startupinfo.wShowWindow, 0)
+
+    def test_non_windows_child_process_options_are_empty(self) -> None:
+        self.assertEqual(hidden_subprocess_kwargs("posix"), {})
+
+    def test_submit_passes_exact_machine_shape_to_kaggle_cli(self) -> None:
+        adapter = KaggleCliAdapter()
+        calls = []
+
+        def fake_run(args, *_rest):
+            calls.append(args)
+            return (
+                "Kernel version 1 successfully pushed. Please check progress at "
+                "https://www.kaggle.com/code/expected-owner/expected-slug"
+            )
+
+        adapter._run = fake_run  # type: ignore[method-assign]
+        adapter.submit(
+            {
+                "source_dir": "staged",
+                "kernel_slug": "expected-owner/expected-slug",
+                "metadata": {
+                    "accelerator": "gpu",
+                    "machine_shape": "NvidiaTeslaT4",
+                },
+            },
+            {},
+            threading.Event(),
+        )
+        self.assertEqual(
+            calls,
+            [[
+                "kernels",
+                "push",
+                "-p",
+                "staged",
+                "--accelerator",
+                "NvidiaTeslaT4",
+            ]],
+        )
+
+    def test_diagnostics_uses_kernel_logs_without_downloading_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            adapter = KaggleCliAdapter()
+            calls = []
+
+            def fake_run(args, *_rest):
+                calls.append(args)
+                return "Traceback: remote failure"
+
+            adapter._run = fake_run  # type: ignore[method-assign]
+            result = adapter.diagnostics(
+                {
+                    "output_dir": temporary,
+                    "kernel_slug": "expected-owner/expected-slug",
+                },
+                {},
+                threading.Event(),
+            )
+            self.assertEqual(
+                calls, [["kernels", "logs", "expected-owner/expected-slug"]]
+            )
+            log_path = Path(temporary) / result["files"][0]
+            self.assertEqual(
+                log_path.read_text(encoding="utf-8").strip(),
+                "Traceback: remote failure",
+            )
+
+    def test_live_logs_use_bounded_follow_stream(self) -> None:
+        adapter = KaggleCliAdapter()
+        calls = []
+
+        def fake_follow(args, *_rest):
+            calls.append(args)
+            return "live line one\nlive line two"
+
+        adapter._run_follow_snapshot = fake_follow  # type: ignore[method-assign]
+        result = adapter.logs(
+            {"kernel_slug": "expected-owner/expected-slug"},
+            {},
+            threading.Event(),
+        )
+
+        self.assertEqual(result, "live line one\nlive line two")
+        self.assertEqual(
+            calls,
+            [["kernels", "logs", "--follow", "expected-owner/expected-slug"]],
+        )
+
     def test_submit_rejects_remote_owner_or_slug_drift(self) -> None:
         adapter = KaggleCliAdapter()
         adapter._run = lambda *_args, **_kwargs: (  # type: ignore[method-assign]
@@ -93,6 +226,33 @@ class KaggleCliAdapterTests(unittest.TestCase):
 
 
 class StorageAndCredentialsTests(unittest.TestCase):
+    def test_job_runtime_fields_are_promoted_for_all_clients(self) -> None:
+        decorated = ControlPlaneService._decorate_job(
+            {
+                "metadata": {
+                    "accelerator": "gpu",
+                    "machine_shape": "NvidiaTeslaT4",
+                },
+                "remote_started_at": "2026-08-21T00:00:00+00:00",
+                "finished_at": "2026-08-21T00:02:03+00:00",
+                "result": {
+                    "output": {
+                        "runtime": {
+                            "python": "3.12.13",
+                            "cuda_device": "Tesla T4",
+                        }
+                    }
+                },
+            }
+        )
+        self.assertEqual(decorated["accelerator"], "gpu")
+        self.assertEqual(decorated["machine_shape"], "NvidiaTeslaT4")
+        self.assertEqual(decorated["elapsed_seconds"], 123)
+        self.assertEqual(
+            decorated["runtime"],
+            {"python": "3.12.13", "cuda_device": "Tesla T4"},
+        )
+
     def test_modern_token_identity_is_introspected_without_returning_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -217,6 +377,112 @@ class StorageAndCredentialsTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_running_job_syncs_incremental_remote_logs_without_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = make_source(root, "live-log-source")
+            service = ControlPlaneService(
+                root / "state.sqlite3",
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=FakeKaggleAdapter(poll_delay_seconds=0.005),
+                vault=EnvCredentialVault({"LIVE_LOG_ACCOUNT": "secret-token"}),
+                remote_poll_seconds=0.005,
+                live_log_poll_seconds=0.001,
+                dispatch_poll_seconds=0.005,
+            )
+            try:
+                account = service.create_account(
+                    account_payload("live-log-user", "LIVE_LOG_ACCOUNT"), "tester"
+                )
+                batch = service.create_batch(
+                    {
+                        "name": "live logs",
+                        "jobs": [{
+                            "account_id": account["id"],
+                            "experiment_name": "live log experiment",
+                            "source_dir": str(source),
+                            "kernel_slug": "live-log-experiment",
+                            "metadata": {
+                                "accelerator": "cpu",
+                                "fake_polls": 5,
+                                "fake_live_logs": [
+                                    "loading dataset",
+                                    "secret-token must be redacted",
+                                    "evaluation complete",
+                                ],
+                            },
+                        }],
+                    },
+                    "tester",
+                )
+                job = wait_for_status(service, batch["jobs"][0]["id"], {"succeeded"})
+                synced = [
+                    line
+                    for event in job["events"]
+                    if event["message"] == "Synced live Kaggle output"
+                    for line in event["details"]["lines"]
+                ]
+                self.assertEqual(
+                    synced,
+                    ["loading dataset", "[REDACTED] must be redacted", "evaluation complete"],
+                )
+            finally:
+                service.close()
+
+    def test_failed_job_download_includes_redacted_kaggle_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = make_source(root, "failed-source")
+            secret = "remote-log-secret-token"
+            service = ControlPlaneService(
+                root / "state.sqlite3",
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=FakeKaggleAdapter(poll_delay_seconds=0.005),
+                vault=EnvCredentialVault({"FAILED_ACCOUNT": secret}),
+                remote_poll_seconds=0.005,
+                dispatch_poll_seconds=0.005,
+            )
+            try:
+                account = service.create_account(
+                    account_payload("failed-user", "FAILED_ACCOUNT"), "tester"
+                )
+                batch = service.create_batch(
+                    {
+                        "name": "failed diagnostics",
+                        "jobs": [{
+                            "account_id": account["id"],
+                            "experiment_name": "failed experiment",
+                            "source_dir": str(source),
+                            "kernel_slug": "failed-experiment",
+                            "metadata": {
+                                "accelerator": "cpu",
+                                "fake_outcome": "failed",
+                                "fake_remote_log": (
+                                    f"Traceback (most recent call last): {secret}"
+                                ),
+                            },
+                        }],
+                    },
+                    "tester",
+                )
+                job_id = batch["jobs"][0]["id"]
+                failed = wait_for_status(service, job_id, {"failed"})
+                self.assertIn("failure_output", failed["result"])
+                output_dir = Path(failed["output_dir"])
+                for existing_log in output_dir.glob("*.log"):
+                    existing_log.unlink()
+
+                _name, log_path = service.job_logs_download(job_id)
+                log_text = log_path.read_text(encoding="utf-8")
+                self.assertIn("=== Kaggle remote log:", log_text)
+                self.assertIn("Traceback (most recent call last)", log_text)
+                self.assertIn("[REDACTED]", log_text)
+                self.assertNotIn(secret, log_text)
+            finally:
+                service.close()
+
     def test_logs_paginate_and_result_zip_contains_manifest_and_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -526,6 +792,22 @@ class SchedulerTests(unittest.TestCase):
                             "name": "bad accelerator",
                             "jobs": [
                                 {**base_job, "metadata": {"accelerator": "quantum"}}
+                            ],
+                        },
+                        "tester",
+                    )
+                with self.assertRaisesRegex(ValidationError, "machine_shape"):
+                    service.create_batch(
+                        {
+                            "name": "unsafe GPU shape",
+                            "jobs": [
+                                {
+                                    **base_job,
+                                    "metadata": {
+                                        "accelerator": "gpu",
+                                        "machine_shape": "NvidiaTeslaP100",
+                                    },
+                                }
                             ],
                         },
                         "tester",

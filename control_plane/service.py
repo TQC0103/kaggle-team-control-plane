@@ -7,15 +7,20 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .adapters import (
+    DEFAULT_GPU_MACHINE_SHAPE,
     DEFAULT_MAX_SOURCE_BYTES,
+    DEFAULT_TPU_MACHINE_SHAPE,
     FakeKaggleAdapter,
     KaggleAdapter,
     KaggleCliAdapter,
+    hidden_subprocess_kwargs,
     normalize_kernel_slug,
 )
 from .credentials import EnvCredentialVault, validate_env_ref
@@ -37,6 +42,8 @@ SECRET_INPUT_FIELDS = {
     "access_token",
     "client_secret",
 }
+GPU_MACHINE_SHAPES = {DEFAULT_GPU_MACHINE_SHAPE}
+TPU_MACHINE_SHAPES = {DEFAULT_TPU_MACHINE_SHAPE}
 
 
 def _required_text(payload: dict[str, Any], name: str, max_length: int = 500) -> str:
@@ -69,6 +76,7 @@ class ControlPlaneService:
         max_workers: int = 10,
         max_jobs_per_account: int = 2,
         remote_poll_seconds: float = 5.0,
+        live_log_poll_seconds: float = 30.0,
         dispatch_poll_seconds: float = 0.1,
         allowed_source_root: str | Path | None = None,
         max_source_bytes: int = DEFAULT_MAX_SOURCE_BYTES,
@@ -103,6 +111,7 @@ class ControlPlaneService:
             max_workers=max_workers,
             max_jobs_per_account=max_jobs_per_account,
             remote_poll_seconds=remote_poll_seconds,
+            live_log_poll_seconds=live_log_poll_seconds,
             dispatch_poll_seconds=dispatch_poll_seconds,
             max_source_bytes=max_source_bytes,
             quota_sync_seconds=quota_sync_seconds,
@@ -122,6 +131,47 @@ class ControlPlaneService:
             "scheduler": self.scheduler.snapshot(),
             "recovered_jobs_on_start": self.recovered_jobs,
         }
+
+    @staticmethod
+    def _decorate_job(job: dict[str, Any]) -> dict[str, Any]:
+        decorated = dict(job)
+        metadata = decorated.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        accelerator = str(metadata.get("accelerator") or "cpu")
+        decorated["accelerator"] = accelerator
+        decorated["machine_shape"] = metadata.get("machine_shape")
+
+        result = decorated.get("result")
+        output = result.get("output") if isinstance(result, dict) else None
+        runtime = output.get("runtime") if isinstance(output, dict) else None
+        decorated["runtime"] = runtime if isinstance(runtime, dict) else None
+
+        started_at = decorated.get("remote_started_at") or decorated.get("started_at")
+        finished_at = decorated.get("finished_at")
+        if isinstance(started_at, str):
+            try:
+                start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                end = (
+                    datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+                    if isinstance(finished_at, str)
+                    else datetime.now(timezone.utc)
+                )
+                decorated["elapsed_seconds"] = max(0, int((end - start).total_seconds()))
+            except ValueError:
+                decorated["elapsed_seconds"] = None
+        else:
+            decorated["elapsed_seconds"] = None
+        return decorated
+
+    @classmethod
+    def _decorate_batch(cls, batch: dict[str, Any]) -> dict[str, Any]:
+        decorated = dict(batch)
+        jobs = decorated.get("jobs")
+        if isinstance(jobs, list):
+            decorated["jobs"] = [
+                cls._decorate_job(job) if isinstance(job, dict) else job for job in jobs
+            ]
+        return decorated
 
     @staticmethod
     def _reject_secrets(payload: dict[str, Any]) -> None:
@@ -205,6 +255,7 @@ class ControlPlaneService:
                     errors="replace",
                     timeout=20,
                     check=False,
+                    **hidden_subprocess_kwargs(),
                 )
             except subprocess.TimeoutExpired as exc:
                 raise ValidationError("Kaggle credential inspection timed out") from exc
@@ -432,6 +483,7 @@ class ControlPlaneService:
             metadata = raw.get("metadata") or {}
             if not isinstance(metadata, dict):
                 raise ValidationError(f"jobs[{index}].metadata must be an object")
+            metadata = dict(metadata)
             self._reject_nested_secrets(metadata, f"jobs[{index}].metadata")
             accelerator = metadata.get("accelerator", "cpu")
             if accelerator == "auto":
@@ -441,6 +493,29 @@ class ControlPlaneService:
                 raise ValidationError(
                     f"jobs[{index}].metadata.accelerator must be gpu, tpu, or cpu"
                 )
+            machine_shape = metadata.get("machine_shape")
+            if accelerator == "gpu":
+                machine_shape = machine_shape or DEFAULT_GPU_MACHINE_SHAPE
+                if machine_shape not in GPU_MACHINE_SHAPES:
+                    raise ValidationError(
+                        f"jobs[{index}].metadata.machine_shape must be "
+                        f"{DEFAULT_GPU_MACHINE_SHAPE} for GPU jobs"
+                    )
+                metadata["machine_shape"] = machine_shape
+            elif accelerator == "tpu":
+                machine_shape = machine_shape or DEFAULT_TPU_MACHINE_SHAPE
+                if machine_shape not in TPU_MACHINE_SHAPES:
+                    raise ValidationError(
+                        f"jobs[{index}].metadata.machine_shape must be "
+                        f"{DEFAULT_TPU_MACHINE_SHAPE} for TPU jobs"
+                    )
+                metadata["machine_shape"] = machine_shape
+            elif machine_shape not in {None, ""}:
+                raise ValidationError(
+                    f"jobs[{index}].metadata.machine_shape is not valid for CPU jobs"
+                )
+            else:
+                metadata.pop("machine_shape", None)
             self._ensure_account_dispatchable(
                 account, accelerator=accelerator, location=f"jobs[{index}] account"
             )
@@ -483,13 +558,15 @@ class ControlPlaneService:
             )
         batch = self.database.create_batch(name, specs, actor, self.artifact_root)
         self.scheduler.wake()
-        return batch
+        return self._decorate_batch(batch)
 
     def list_batches(self) -> list[dict[str, Any]]:
-        return self.database.list_batches()
+        return [self._decorate_batch(batch) for batch in self.database.list_batches()]
 
     def get_batch(self, batch_id: str) -> dict[str, Any]:
-        return self.database.get_batch(batch_id, include_jobs=True)
+        return self._decorate_batch(
+            self.database.get_batch(batch_id, include_jobs=True)
+        )
 
     def list_jobs(
         self,
@@ -498,17 +575,20 @@ class ControlPlaneService:
         account_id: str | None = None,
         status: str | None = None,
     ) -> list[dict[str, Any]]:
-        return self.database.list_jobs(
-            batch_id=batch_id, account_id=account_id, status=status
-        )
+        return [
+            self._decorate_job(job)
+            for job in self.database.list_jobs(
+                batch_id=batch_id, account_id=account_id, status=status
+            )
+        ]
 
     def get_job(self, job_id: str) -> dict[str, Any]:
-        return self.database.get_job(job_id)
+        return self._decorate_job(self.database.get_job(job_id))
 
     def cancel_job(self, job_id: str, actor: str) -> dict[str, Any]:
         job, semantics = self.database.request_cancel(job_id, actor)
         self.scheduler.request_cancel(job_id)
-        return {"job": job, "cancel_semantics": semantics}
+        return {"job": self._decorate_job(job), "cancel_semantics": semantics}
 
     def retry_job(self, job_id: str, actor: str) -> dict[str, Any]:
         original = self.database.get_job(job_id)
@@ -520,10 +600,11 @@ class ControlPlaneService:
         )
         retry = self.database.retry_job(job_id, actor, self.artifact_root)
         self.scheduler.wake()
-        return retry
+        return self._decorate_job(retry)
 
     def job_result(self, job_id: str) -> dict[str, Any]:
         job = self.database.get_job(job_id)
+        decorated = self._decorate_job(job)
         return {
             "job_id": job_id,
             "status": job["status"],
@@ -533,10 +614,15 @@ class ControlPlaneService:
             "output_dir": job["output_dir"],
             "remote_may_be_running": job["remote_may_be_running"],
             "events": job["events"],
+            "accelerator": decorated["accelerator"],
+            "machine_shape": decorated["machine_shape"],
+            "elapsed_seconds": decorated["elapsed_seconds"],
+            "runtime": decorated["runtime"],
         }
 
     def job_logs_download(self, job_id: str) -> tuple[str, Path]:
         job = self.database.get_job(job_id)
+        remote_logs = self._failed_remote_logs(job)
         events = self.database.list_job_events(job_id, limit=10000)
         downloads = (self.data_dir / "downloads").resolve()
         downloads.mkdir(parents=True, exist_ok=True)
@@ -561,8 +647,76 @@ class ControlPlaneService:
                     f"[{str(event.get('level', 'info')).upper()}] "
                     f"{event.get('message', '')}{detail_text}\n"
                 )
+            remaining_bytes = 5 * 1024 * 1024
+            output_dir = Path(job["output_dir"]).resolve()
+            for remote_log in remote_logs[:20]:
+                if remaining_bytes <= 0:
+                    break
+                payload = remote_log.read_bytes()[:remaining_bytes]
+                remaining_bytes -= len(payload)
+                relative = str(remote_log.relative_to(output_dir))
+                output.write(f"\n=== Kaggle remote log: {relative} ===\n")
+                output.write(payload.decode("utf-8", errors="replace"))
+                if payload and not payload.endswith(b"\n"):
+                    output.write("\n")
         temporary_path.replace(log_path)
         return log_path.name, log_path
+
+    def _failed_remote_logs(self, job: dict[str, Any]) -> list[Path]:
+        if job["status"] != "failed":
+            return []
+        output_dir = Path(job["output_dir"]).resolve()
+        artifact_root = self.artifact_root.resolve()
+        if not output_dir.is_relative_to(artifact_root):
+            raise ValidationError("job output directory is outside the managed artifact root")
+        existing = (
+            sorted(path.resolve() for path in output_dir.rglob("*.log"))
+            if output_dir.is_dir()
+            else []
+        )
+        existing = [
+            path
+            for path in existing
+            if (
+                path.is_file()
+                and path.stat().st_size > 0
+                and path.is_relative_to(output_dir)
+            )
+        ]
+        if existing:
+            return existing
+
+        account = self.database.get_account(job["account_id"])
+        credential_ref = account.get("credential_env_ref")
+        if not credential_ref:
+            return []
+        config_dir = (self.data_dir / "kaggle-config" / job["id"]).resolve()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        env = self.vault.build_subprocess_env(
+            credential_ref, account["kaggle_username"], config_dir
+        )
+        try:
+            raw_output = self.adapter.diagnostics(job, env, threading.Event())
+            JobScheduler._redact_downloaded_text_files(raw_output, env)
+            safe_output = JobScheduler._redact(raw_output, env)
+            self.database.append_job_event(
+                job["id"],
+                "Downloaded failed Kaggle kernel diagnostics on demand",
+                details={"file_count": len(safe_output.get("files", []))},
+            )
+        except Exception as exc:
+            self.database.append_job_event(
+                job["id"],
+                "Could not download failed Kaggle kernel diagnostics on demand",
+                details={"error": JobScheduler._redact(str(exc), env)},
+                level="warning",
+            )
+            return []
+        return sorted(
+            path.resolve()
+            for path in output_dir.rglob("*.log")
+            if path.is_file() and path.resolve().is_relative_to(output_dir)
+        )
 
     def job_events_page(
         self, job_id: str, *, before_id: int | None = None, limit: int = 200

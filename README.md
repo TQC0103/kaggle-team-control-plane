@@ -67,7 +67,30 @@ The helper prompts with masked input. On Windows it can save encrypted copies
 using DPAPI, so only the same Windows user on the same machine can decrypt them.
 It never writes a plaintext token to `.env`, SQLite, or the repository.
 
+The desktop app also supports per-member **Sign in with Kaggle** onboarding.
+Kaggle's official OAuth page opens in the user's browser, so passwords and 2FA
+never enter Control Plane. The returned refresh credential is kept only in the
+Windows DPAPI store; access tokens are refreshed in memory and passed only to
+the explicitly assigned job subprocess. The OAuth flow deliberately bypasses
+Kaggle's default plaintext `~/.kaggle/credentials.json` persistence.
+
 ### Windows desktop app
+
+The packaged desktop launches recurring Kaggle CLI polling and credential
+inspection without creating visible console windows, so background status
+refreshes do not steal focus or flash a terminal.
+
+Run rows, account cards, and the run drawer consume the same backend-normalized
+accelerator and elapsed-runtime fields. Completed jobs additionally surface an
+allow-listed `runtime.json` summary (Python, Torch, CUDA, device, and model
+library versions) when the downloaded artifact provides one.
+
+While a kernel is queued or running, the scheduler also samples Kaggle's live
+`kernels logs --follow` stream every 30 seconds (`KCP_LIVE_LOG_POLL_SECONDS`),
+redacts credential values, and persists only bounded incremental updates. The open run drawer refreshes
+automatically every 10 seconds and includes a manual **Refresh** button, so the
+Kaggle browser page is no longer required for routine monitoring. A temporary
+log-fetch failure is shown as a warning and does not fail the running job.
 
 Build and install the native one-click shell once:
 
@@ -82,6 +105,12 @@ store, and shuts both services down when the window closes. **App settings** can
 add, replace, or forget encrypted Kaggle tokens and select the experiment source
 folder. Account/token/database changes are runtime data and never require a
 frontend or EXE rebuild. Only code updates require rebuilding the app.
+
+To onboard a member without copying an API token, choose **Add member**, click
+**Sign in with Kaggle**, and finish authentication in the browser. After Kaggle
+returns to Control Plane, verify the detected owner, record explicit consent,
+and choose **Connect account**. Manual token entry remains available as a
+fallback in **App settings**.
 
 For a shareable single-file installer that provisions Kaggle CLI when needed:
 
@@ -158,7 +187,13 @@ used above, for example the absolute result of:
 Assign each experiment to its actual owner account. A kernel slug may be just
 `family-smoke-01`; the control plane prefixes and validates the assigned Kaggle
 username. The source field includes a local folder browser constrained to the
-configured `-SourceRoot`. Start with CPU smoke jobs before using accelerators.
+configured source root. GPU dispatch is pinned end-to-end to
+`NvidiaTeslaT4`: the backend writes the shape into kernel metadata and passes it
+to `kaggle kernels push --accelerator`, rather than relying on Kaggle's P100
+default. TPU dispatch similarly uses `TpuV38`; CPU jobs omit a machine shape.
+The API rejects unsupported or accelerator/shape-mismatched values.
+
+Start with CPU smoke jobs before using accelerators.
 
 The scheduler permits up to two simultaneous jobs per account and still caps a
 batch at ten jobs. A third job for the same account stays queued until one of
@@ -266,9 +301,13 @@ GET   /api/jobs/{id}/result/download
 GET   /api/audit
 ```
 
-Run details render logs in bounded chunks and page older events on demand. The
-log download is UTF-8 text. A successful result download is a streamed ZIP
-containing `job-result.json` plus every managed artifact downloaded from Kaggle.
+Run details render live remote output and Control Plane events in bounded chunks
+and page older events on demand. For failed kernels, the scheduler downloads Kaggle diagnostics automatically; the
+log endpoint also fetches them on demand for failures created before this
+feature existed. Credential values are redacted from downloaded text artifacts,
+and the UTF-8 log combines Control Plane events with bounded remote `.log`
+content. A successful result download is a streamed ZIP containing
+`job-result.json` plus every managed artifact downloaded from Kaggle.
 
 ## Network and credential boundary
 

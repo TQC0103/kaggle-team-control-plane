@@ -45,6 +45,9 @@ type Run = {
   username: string;
   status: RunState;
   accelerator: string;
+  acceleratorKind: string;
+  machineShape?: string;
+  runtimeInfo?: Record<string, string>;
   sourcePath: string;
   progress: number;
   createdAt: string;
@@ -75,6 +78,7 @@ type DraftExperiment = {
   sourcePath: string;
   kernelSlug: string;
   accelerator: string;
+  machineShape: string;
 };
 
 type CredentialRefOption = {
@@ -107,16 +111,20 @@ type DesktopSettings = {
 
 type DesktopResult = {
   ok: boolean;
+  state?: "idle" | "pending" | "succeeded" | "failed";
   error?: string;
   cancelled?: boolean;
   credential_ref?: string;
   source_root?: string;
   restart_required?: boolean;
+  username?: string;
 };
 
 type DesktopApi = {
   get_settings: () => Promise<DesktopSettings>;
   save_credential: (credentialRef: string, token: string) => Promise<DesktopResult>;
+  start_kaggle_oauth: (credentialRef: string) => Promise<DesktopResult>;
+  get_kaggle_oauth_status: () => Promise<DesktopResult>;
   forget_credential: (credentialRef: string) => Promise<DesktopResult>;
   choose_source_root: () => Promise<DesktopResult>;
   open_data_folder: () => Promise<DesktopResult>;
@@ -156,6 +164,37 @@ function numberValue(record: Record<string, unknown>, keys: string[], fallback =
     if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
   }
   return fallback;
+}
+
+function objectValue(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function formatDuration(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  const whole = Math.floor(seconds);
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const remainingSeconds = whole % 60;
+  return hours > 0
+    ? `${hours}h ${String(minutes).padStart(2, "0")}m`
+    : `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s`;
+}
+
+function acceleratorLabel(accelerator: string, machineShape: string) {
+  const kind = accelerator.toLowerCase();
+  if (kind === "gpu") {
+    const device = machineShape === "NvidiaTeslaT4" ? "Tesla T4" : machineShape;
+    return device ? `GPU · ${device}` : "GPU";
+  }
+  if (kind === "tpu") {
+    const device = machineShape === "TpuV38" ? "V3-8" : machineShape;
+    return device ? `TPU · ${device}` : "TPU";
+  }
+  return kind === "cpu" ? "CPU" : accelerator || "Unknown";
 }
 
 function normalizeStatus(value: string): RunState {
@@ -207,20 +246,27 @@ function quotaText(resource: QuotaResource) {
     : `${resource.remainingHours.toFixed(1)} / ${resource.totalHours.toFixed(1)}h`;
 }
 
+function eventLogLines(event: unknown): string[] {
+  const item = (event && typeof event === "object" ? event : {}) as Record<string, unknown>;
+  const timestamp = textValue(item, ["created_at", "time", "timestamp"], "");
+  const shortTime = timestamp.includes("T") ? timestamp.split("T")[1]?.slice(0, 8) : timestamp;
+  const level = textValue(item, ["level"], "info").toUpperCase();
+  const message = textValue(item, ["message", "detail"], "Job event");
+  const prefix = `${shortTime || "--:--:--"}`;
+  const details = objectValue(item, "details");
+  const remoteLines = Array.isArray(details.lines)
+    ? details.lines.map((line) => `${prefix}  REMOTE  ${String(line)}`)
+    : [];
+  return [`${prefix}  ${level.padEnd(7)} ${message}`, ...remoteLines];
+}
+
 function normalizeRun(value: unknown, index: number, accounts: Account[]): Run {
   const raw = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
   const accountId = textValue(raw, ["account_id", "accountId", "owner_id"], "");
   const account = accounts.find((item) => item.id === accountId);
   const logValue = raw.logs ?? raw.log;
   const events = Array.isArray(raw.events) ? raw.events : [];
-  const eventLogs = events.map((event) => {
-    const item = (event && typeof event === "object" ? event : {}) as Record<string, unknown>;
-    const timestamp = textValue(item, ["created_at", "time", "timestamp"], "");
-    const shortTime = timestamp.includes("T") ? timestamp.split("T")[1]?.slice(0, 8) : timestamp;
-    const level = textValue(item, ["level"], "info").toUpperCase();
-    const message = textValue(item, ["message", "detail"], "Job event");
-    return `${shortTime || "--:--:--"}  ${level.padEnd(7)} ${message}`;
-  });
+  const eventLogs = events.flatMap(eventLogLines);
   const logs = Array.isArray(logValue)
     ? logValue.map(String)
     : typeof logValue === "string"
@@ -229,6 +275,27 @@ function normalizeRun(value: unknown, index: number, accounts: Account[]): Run {
         ? eventLogs
         : ["Open this run while connected to load its event trace."];
   const resultValue = raw.result;
+  const metadata = objectValue(raw, "metadata");
+  const result = objectValue(raw, "result");
+  const output = objectValue(result, "output");
+  const runtimeSource = Object.keys(objectValue(raw, "runtime")).length
+    ? objectValue(raw, "runtime")
+    : objectValue(output, "runtime");
+  const runtimeInfo = Object.fromEntries(
+    Object.entries(runtimeSource)
+      .filter(([, item]) => ["string", "number", "boolean"].includes(typeof item))
+      .map(([key, item]) => [key, String(item)]),
+  );
+  const acceleratorKind = textValue(
+    raw,
+    ["accelerator"],
+    textValue(metadata, ["accelerator"], "cpu"),
+  );
+  const machineShape = textValue(
+    raw,
+    ["machine_shape"],
+    textValue(metadata, ["machine_shape"], ""),
+  );
   const resultSummary = resultValue && typeof resultValue === "object"
     ? JSON.stringify(resultValue)
     : typeof resultValue === "string"
@@ -241,11 +308,18 @@ function normalizeRun(value: unknown, index: number, accounts: Account[]): Run {
     owner: textValue(raw, ["owner", "owner_name"], account?.owner || "Unassigned"),
     username: textValue(raw, ["username", "account_username"], account?.username || "unknown"),
     status: normalizeStatus(textValue(raw, ["status", "state"], "queued")),
-    accelerator: textValue(raw, ["accelerator", "gpu"], "Auto"),
+    accelerator: acceleratorLabel(acceleratorKind, machineShape),
+    acceleratorKind,
+    machineShape: machineShape || undefined,
+    runtimeInfo: Object.keys(runtimeInfo).length ? runtimeInfo : undefined,
     sourcePath: textValue(raw, ["source_dir", "source_path", "sourcePath", "kernel_ref", "kernel_slug"], "—"),
     progress: Math.min(100, Math.max(0, numberValue(raw, ["progress", "percent"], 0))),
     createdAt: textValue(raw, ["created_at", "createdAt", "started_at"], "—"),
-    duration: textValue(raw, ["duration", "elapsed"], "—"),
+    duration: textValue(
+      raw,
+      ["duration", "elapsed"],
+      formatDuration(numberValue(raw, ["elapsed_seconds"], Number.NaN)),
+    ),
     metric: textValue(raw, ["metric", "score"], "") || undefined,
     outputDir: textValue(raw, ["output_dir", "outputDir"], "") || undefined,
     resultSummary,
@@ -392,19 +466,32 @@ export default function Home() {
   const [toast, setToast] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | RunState>("all");
 
-  const openRun = async (run: Run) => {
-    setSelectedRun(run);
+  const refreshRunDetail = useCallback(async (runId: string, quiet = false) => {
     if (connection !== "live") return;
     try {
-      const data = await apiRequest(`/api/jobs/${encodeURIComponent(run.id)}`);
+      const data = await apiRequest(`/api/jobs/${encodeURIComponent(runId)}`);
       const record = data && typeof data === "object" ? data as Record<string, unknown> : {};
       const rawJob = record.job ?? data;
       const detailed = normalizeRun(rawJob, 0, accounts);
-      setSelectedRun({ ...run, ...detailed, owner: run.owner, username: run.username });
+      setSelectedRun((current) => current?.id === runId
+        ? { ...current, ...detailed, owner: current.owner, username: current.username }
+        : current);
     } catch (error) {
-      setToast(`Could not load run detail: ${error instanceof Error ? error.message : "unknown error"}`);
+      if (!quiet) setToast(`Could not load run detail: ${error instanceof Error ? error.message : "unknown error"}`);
     }
+  }, [accounts, connection]);
+
+  const openRun = async (run: Run) => {
+    setSelectedRun(run);
+    await refreshRunDetail(run.id);
   };
+
+  const selectedRunId = selectedRun?.id;
+  useEffect(() => {
+    if (!selectedRunId || connection !== "live") return;
+    const timer = window.setInterval(() => { void refreshRunDetail(selectedRunId, true); }, 10000);
+    return () => window.clearInterval(timer);
+  }, [selectedRunId, connection, refreshRunDetail]);
 
   const refresh = useCallback(async (quiet = false) => {
     if (!quiet) setRefreshing(true);
@@ -689,6 +776,14 @@ export default function Home() {
           <div className="account-grid">
             {accounts.length === 0 && <div className="empty-state"><strong>No accounts connected.</strong><span>Start the real API, then use Add member for each consenting owner.</span></div>}
             {accounts.map((account, index) => {
+              const activeAccelerators = Array.from(new Set(
+                runs
+                  .filter((run) => run.accountId === account.id && (run.status === "running" || run.status === "queued"))
+                  .map((run) => run.accelerator),
+              ));
+              const accountAccelerator = activeAccelerators.length
+                ? activeAccelerators.join(" + ")
+                : "Idle";
               return (
                 <article className={`account-card account-${account.state}`} key={account.id}>
                   <div className="account-topline">
@@ -706,7 +801,7 @@ export default function Home() {
                     </div>
                   )}
                   <div className="account-specs">
-                    <span><small>ACCELERATOR</small><strong>{account.accelerator}</strong></span>
+                    <span><small>ACTIVE ACCELERATOR</small><strong>{accountAccelerator}</strong></span>
                     <span><small>RUNS</small><strong>{account.activeRuns}/{account.maxParallel}</strong></span>
                   </div>
                   <div className="account-quota">
@@ -805,10 +900,12 @@ export default function Home() {
 
       {selectedRun && (
         <RunDrawer
+          key={selectedRun.id}
           run={selectedRun}
           connection={connection}
           onClose={() => setSelectedRun(null)}
           onAction={runAction}
+          onRefresh={() => void refreshRunDetail(selectedRun.id)}
         />
       )}
 
@@ -849,6 +946,7 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
   const [credentialRef, setCredentialRef] = useState("");
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
+  const [oauthBusy, setOauthBusy] = useState(false);
   const [error, setError] = useState("");
 
   const reload = useCallback(async () => {
@@ -887,6 +985,34 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
     await reload();
   };
 
+  const signInWithKaggle = async () => {
+    const api = window.pywebview?.api;
+    if (!api || !credentialRef.trim() || oauthBusy) return;
+    setOauthBusy(true);
+    setError("");
+    const started = await api.start_kaggle_oauth(credentialRef.trim());
+    if (!started.ok) {
+      setOauthBusy(false);
+      setError(started.error || "Could not start Kaggle sign-in.");
+      return;
+    }
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      const status = await api.get_kaggle_oauth_status();
+      if (status.state === "pending") continue;
+      setOauthBusy(false);
+      if (status.state === "succeeded") {
+        await reload();
+        onChanged(`${status.credential_ref || credentialRef} connected as @${status.username || "Kaggle member"}.`);
+      } else {
+        setError(status.error || "Kaggle sign-in did not complete.");
+      }
+      return;
+    }
+    setOauthBusy(false);
+    setError("Kaggle sign-in timed out. You can start it again.");
+  };
+
   const forgetToken = async (ref: string) => {
     if (!window.confirm(`Forget the encrypted token ${ref}? Its account will become unavailable.`)) return;
     const result = await window.pywebview?.api.forget_credential(ref);
@@ -909,7 +1035,7 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
   };
 
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <div className="modal-layer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="account-dialog desktop-settings" role="dialog" aria-modal="true" aria-labelledby="desktop-settings-title">
         <header className="composer-header">
           <div><p className="section-label">WINDOWS APP</p><h2 id="desktop-settings-title">Local app settings.</h2><p>Tokens and accounts are runtime data. Changing them never rebuilds the app.</p></div>
@@ -919,6 +1045,10 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
           {error && <p className="form-error" role="alert">{error}</p>}
           <section className="settings-section">
             <div><p className="section-label">ENCRYPTED TOKENS</p><h3>Owner credentials</h3></div>
+            <div className="oauth-onboarding">
+              <div><strong>Sign in with Kaggle</strong><span>Password and 2FA stay in Kaggle&apos;s browser. OAuth credentials are encrypted with Windows DPAPI.</span></div>
+              <button className="button button-primary" type="button" disabled={oauthBusy || !credentialRef.trim()} onClick={() => void signInWithKaggle()}>{oauthBusy ? "Waiting for Kaggle…" : "Sign in with Kaggle"}</button>
+            </div>
             <div className="credential-list">
               {settings?.credential_refs.map((ref) => (
                 <div key={ref}><code>{ref}</code><button type="button" onClick={() => { setCredentialRef(ref); setToken(""); }}>Replace</button><button type="button" className="danger-link" onClick={() => void forgetToken(ref)}>Forget</button></div>
@@ -962,6 +1092,7 @@ function AccountDialog({ account, connection, onClose, onFinished }: {
   const [credentialOptions, setCredentialOptions] = useState<CredentialRefOption[]>([]);
   const [inspectingCredential, setInspectingCredential] = useState(false);
   const [credentialVerified, setCredentialVerified] = useState(false);
+  const [oauthBusy, setOauthBusy] = useState(false);
 
   const isOffline = connection !== "live";
   const controlState = account?.controlState || (account?.state === "offline" ? "disabled" : "enabled");
@@ -984,6 +1115,45 @@ function AccountDialog({ account, connection, onClose, onFinished }: {
       })
       .catch(() => undefined);
   }, [account, isOffline]);
+
+  const signInWithKaggle = async () => {
+    const api = window.pywebview?.api;
+    if (!api || oauthBusy) {
+      if (!api) setError("Kaggle browser sign-in is available only in the desktop app.");
+      return;
+    }
+    const used = new Set(credentialOptions.map((option) => option.credential_env_ref));
+    let index = 1;
+    while (used.has(`KCP_KAGGLE_MEMBER_${String(index).padStart(2, "0")}`)) index += 1;
+    const ref = `KCP_KAGGLE_MEMBER_${String(index).padStart(2, "0")}`;
+    setOauthBusy(true);
+    setError("");
+    const started = await api.start_kaggle_oauth(ref);
+    if (!started.ok) {
+      setOauthBusy(false);
+      setError(started.error || "Could not start Kaggle sign-in.");
+      return;
+    }
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      const status = await api.get_kaggle_oauth_status();
+      if (status.state === "pending") continue;
+      setOauthBusy(false);
+      if (status.state !== "succeeded") {
+        setError(status.error || "Kaggle sign-in did not complete.");
+        return;
+      }
+      setCredentialOptions((current) => [...current, { credential_env_ref: ref, available: true, registered: false }]);
+      setCredentialEnvRef(ref);
+      setUsername(status.username || "");
+      setOwnerName(status.username || "");
+      setConsentBy(status.username || "");
+      setCredentialVerified(Boolean(status.username));
+      return;
+    }
+    setOauthBusy(false);
+    setError("Kaggle sign-in timed out. You can start it again.");
+  };
 
   const inspectCredential = async () => {
     if (!credentialEnvRef.trim()) {
@@ -1181,6 +1351,7 @@ function AccountDialog({ account, connection, onClose, onFinished }: {
         ) : (
           <form className="account-form" onSubmit={addAccount}>
             {isOffline && <div className="demo-form-banner"><strong>API offline</strong><span>No member can be saved until the real control plane is connected.</span></div>}
+            <div className="oauth-member-entry"><div><strong>New member</strong><span>Use Kaggle OAuth to detect the account without copying a password or API token.</span></div><button type="button" className="button button-primary" disabled={oauthBusy || isOffline} onClick={() => void signInWithKaggle()}>{oauthBusy ? "Waiting for browser…" : "Sign in with Kaggle"}</button></div>
             <div className="account-form-grid">
               <label className="wide"><span>Saved Kaggle credential</span><div className="credential-detect-row"><select value={credentialEnvRef} onChange={(event) => { setCredentialEnvRef(event.target.value); setCredentialVerified(false); }}><option value="">Select a credential</option>{credentialOptions.map((option) => <option key={option.credential_env_ref} value={option.credential_env_ref} disabled={!option.available || option.registered}>{option.credential_env_ref}{option.registered ? " (already connected)" : !option.available ? " (unavailable)" : ""}</option>)}</select><button type="button" className="button button-quiet" onClick={() => void inspectCredential()} disabled={!credentialEnvRef || inspectingCredential}>{inspectingCredential ? "Detecting…" : "Detect account"}</button></div><small>Only the saved reference is shown here; the token never enters the browser.</small></label>
               <label><span>Recommended owner name</span><input value={ownerName} onChange={(event) => setOwnerName(event.target.value)} placeholder="Detected from Kaggle" disabled={!credentialVerified} /></label>
@@ -1216,6 +1387,7 @@ function BatchComposer({ accounts, connection, onClose, onCreated }: {
     sourcePath: "",
     kernelSlug: `team-smoke-${String(index + 1).padStart(2, "0")}`,
     accelerator: "cpu",
+    machineShape: "",
   }), [assignable]);
   const [batchName, setBatchName] = useState("experiment-batch");
   const [drafts, setDrafts] = useState<DraftExperiment[]>(() => [newDraft(0)]);
@@ -1262,12 +1434,12 @@ function BatchComposer({ accounts, connection, onClose, onCreated }: {
         method: "POST",
         body: JSON.stringify({
           name: batchName.trim(),
-          jobs: drafts.map(({ name, accountId, sourcePath, kernelSlug, accelerator }) => ({
+          jobs: drafts.map(({ name, accountId, sourcePath, kernelSlug, accelerator, machineShape }) => ({
             account_id: accountId,
             experiment_name: name.trim(),
             source_dir: sourcePath.trim(),
             kernel_slug: kernelSlug.trim(),
-            metadata: { accelerator },
+            metadata: { accelerator, ...(machineShape ? { machine_shape: machineShape } : {}) },
           })),
         }),
       });
@@ -1311,7 +1483,7 @@ function BatchComposer({ accounts, connection, onClose, onCreated }: {
                       return <option key={account.id} value={account.id} disabled={unavailable}>{account.owner} · @{account.username}{unavailable ? ` (${reason})` : ""}</option>;
                     })}
                   </select><small>{owner ? `GPU ${quotaText(owner.gpuQuota)} · TPU ${quotaText(owner.tpuQuota)}` : "Assignment required"}</small></label>
-                  <label className="draft-field draft-accelerator"><span>Accelerator</span><select value={draft.accelerator} onChange={(event) => updateDraft(draft.localId, { accelerator: event.target.value })}><option value="gpu">GPU</option><option value="tpu">TPU</option><option value="cpu">CPU</option></select></label>
+                  <label className="draft-field draft-accelerator"><span>Accelerator</span><select value={draft.accelerator} onChange={(event) => { const accelerator = event.target.value; updateDraft(draft.localId, { accelerator, machineShape: accelerator === "gpu" ? "NvidiaTeslaT4" : accelerator === "tpu" ? "TpuV38" : "" }); }}><option value="gpu">GPU · Tesla T4</option><option value="tpu">TPU · V3-8</option><option value="cpu">CPU</option></select></label>
                   <button type="button" className="remove-draft" onClick={() => setDrafts((current) => current.filter((item) => item.localId !== draft.localId))} disabled={drafts.length === 1} aria-label={`Remove ${draft.name}`}>×</button>
                 </fieldset>
               );
@@ -1346,19 +1518,21 @@ function BatchComposer({ accounts, connection, onClose, onCreated }: {
   );
 }
 
-function RunDrawer({ run, connection, onClose, onAction }: {
+function RunDrawer({ run, connection, onClose, onAction, onRefresh }: {
   run: Run;
   connection: ConnectionState;
   onClose: () => void;
   onAction: (run: Run, action: "cancel" | "retry" | "result") => void;
+  onRefresh: () => void;
 }) {
-  const [logs, setLogs] = useState(run.logs);
+  const [olderLogs, setOlderLogs] = useState<string[]>([]);
   const [visibleLogLines, setVisibleLogLines] = useState(100);
   const [beforeId, setBeforeId] = useState(run.logBeforeId);
   const [hasOlderLogs, setHasOlderLogs] = useState(run.hasOlderLogs === true);
   const [loadingOlderLogs, setLoadingOlderLogs] = useState(false);
   const [downloading, setDownloading] = useState<"logs" | "result" | null>(null);
   const [downloadError, setDownloadError] = useState("");
+  const logs = [...olderLogs, ...run.logs];
   const shownLogs = logs.slice(-visibleLogLines);
 
   const loadOlderLogs = async () => {
@@ -1369,13 +1543,8 @@ function RunDrawer({ run, connection, onClose, onAction }: {
       const value = await apiRequest(`/api/jobs/${encodeURIComponent(run.id)}/events?before_id=${beforeId}&limit=200`);
       const record = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
       const events = asList(record, ["events"]);
-      const older = events.map((event) => {
-        const item = (event && typeof event === "object" ? event : {}) as Record<string, unknown>;
-        const timestamp = textValue(item, ["created_at"], "");
-        const shortTime = timestamp.includes("T") ? timestamp.split("T")[1]?.slice(0, 8) : timestamp;
-        return `${shortTime || "--:--:--"}  ${textValue(item, ["level"], "info").toUpperCase().padEnd(7)} ${textValue(item, ["message"], "Job event")}`;
-      });
-      setLogs((current) => [...older, ...current]);
+      const older = events.flatMap(eventLogLines);
+      setOlderLogs((current) => [...older, ...current]);
       setVisibleLogLines((current) => current + older.length);
       setBeforeId(numberValue(record, ["before_id"], 0) || undefined);
       setHasOlderLogs(record.has_more === true);
@@ -1417,13 +1586,24 @@ function RunDrawer({ run, connection, onClose, onAction }: {
           <div><dt>Owner</dt><dd>{run.owner} <small>@{run.username}</small></dd></div>
           <div><dt>Accelerator</dt><dd>{run.accelerator}</dd></div>
           <div><dt>Runtime</dt><dd>{run.duration}</dd></div>
+          <div><dt>Machine shape</dt><dd>{run.machineShape || <EmptyMark />}</dd></div>
           <div><dt>Metric</dt><dd>{run.metric || <EmptyMark />}</dd></div>
+          {run.runtimeInfo && (
+            <div className="wide runtime-manifest">
+              <dt>Resolved runtime</dt>
+              <dd>
+                {Object.entries(run.runtimeInfo).map(([key, value]) => (
+                  <span key={key}><small>{key.replaceAll("_", " ")}</small><code>{value}</code></span>
+                ))}
+              </dd>
+            </div>
+          )}
           <div className="wide"><dt>Source</dt><dd><code>{run.sourcePath}</code></dd></div>
           {run.outputDir && <div className="wide"><dt>Output directory</dt><dd><code>{run.outputDir}</code></dd></div>}
           {run.resultSummary && <div className="wide"><dt>Result preview</dt><dd><ResultPreview value={run.resultSummary} /></dd></div>}
         </dl>
         <div className="drawer-progress"><div><span>Run progress</span><strong>{run.progress}%</strong></div><div role="progressbar" aria-label="Run progress" aria-valuenow={run.progress} aria-valuemin={0} aria-valuemax={100}><i style={{ width: `${run.progress}%` }} /></div></div>
-        <section className="log-panel" aria-labelledby="log-title"><header><h3 id="log-title">Live output</h3><span>Rendering {shownLogs.length} · {logs.length} loaded</span></header>{hasOlderLogs && <button type="button" className="load-more-logs load-older-logs" disabled={loadingOlderLogs} onClick={() => void loadOlderLogs()}>{loadingOlderLogs ? "Loading…" : "Load 200 older lines"}</button>}<pre>{shownLogs.map((line, index) => <code key={`${line}-${index}`}><span>{String(Math.max(1, logs.length - shownLogs.length + index + 1)).padStart(2, "0")}</span>{line}</code>)}</pre>{visibleLogLines < logs.length && <button type="button" className="load-more-logs" onClick={() => setVisibleLogLines((current) => current + 200)}>Render 200 more loaded lines</button>}</section>
+        <section className="log-panel" aria-labelledby="log-title"><header><h3 id="log-title">Live output</h3><div><span>Kaggle sync ≤30s · {logs.length} loaded</span><button type="button" onClick={onRefresh} disabled={connection !== "live"}>Refresh</button></div></header>{hasOlderLogs && <button type="button" className="load-more-logs load-older-logs" disabled={loadingOlderLogs} onClick={() => void loadOlderLogs()}>{loadingOlderLogs ? "Loading…" : "Load 200 older lines"}</button>}<pre>{shownLogs.map((line, index) => <code key={`${line}-${index}`}><span>{String(Math.max(1, logs.length - shownLogs.length + index + 1)).padStart(2, "0")}</span>{line}</code>)}</pre>{visibleLogLines < logs.length && <button type="button" className="load-more-logs" onClick={() => setVisibleLogLines((current) => current + 200)}>Render 200 more loaded lines</button>}</section>
         {downloadError && <p className="drawer-download-error" role="alert">{downloadError}</p>}
         <footer className="drawer-actions">
           {(run.status === "running" || run.status === "queued") && <button className="button button-danger" onClick={() => onAction(run, "cancel")}>Cancel run</button>}
