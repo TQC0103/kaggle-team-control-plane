@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import gc
 import http.client
 import io
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -207,6 +209,43 @@ class KaggleCliAdapterTests(unittest.TestCase):
             calls,
             [["kernels", "logs", "--follow", "expected-owner/expected-slug"]],
         )
+
+    def test_live_log_snapshot_captures_unbuffered_partial_output(self) -> None:
+        adapter = KaggleCliAdapter(
+            executable=sys.executable,
+            command_poll_seconds=0.01,
+            live_log_capture_seconds=0.2,
+        )
+        output = adapter._run_follow_snapshot(
+            ["-c", "import time; print('live partial', end=''); time.sleep(10)"],
+            {},
+            threading.Event(),
+        )
+        self.assertEqual(output, "live partial")
+
+    def test_live_log_snapshot_does_not_wait_for_inherited_pipe(self) -> None:
+        adapter = KaggleCliAdapter(
+            executable=sys.executable,
+            command_poll_seconds=0.01,
+            live_log_capture_seconds=0.5,
+        )
+        started = time.monotonic()
+        output = adapter._run_follow_snapshot(
+            [
+                "-c",
+                (
+                    "import subprocess, sys, time; "
+                    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.75)']); "
+                    "print('parent output', flush=True); time.sleep(10)"
+                ),
+            ],
+            {},
+            threading.Event(),
+        )
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(output, "parent output")
+        time.sleep(1.0)
+        gc.collect()
 
     def test_submit_rejects_remote_owner_or_slug_drift(self) -> None:
         adapter = KaggleCliAdapter()
@@ -950,7 +989,7 @@ class SchedulerTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_restart_blocks_account_until_remote_reconciliation(self) -> None:
+    def test_restart_preserves_running_remote_job_and_blocks_new_work(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = make_source(root, "restart-source")
@@ -1001,7 +1040,7 @@ class SchedulerTests(unittest.TestCase):
             try:
                 self.assertEqual(second.recovered_jobs, 1)
                 recovered = second.get_job(job_id)
-                self.assertEqual(recovered["status"], "failed")
+                self.assertEqual(recovered["status"], "running")
                 self.assertTrue(recovered["remote_may_be_running"])
                 self.assertTrue(
                     second.get_account(account["id"])[
@@ -1023,12 +1062,9 @@ class SchedulerTests(unittest.TestCase):
                         },
                         "tester",
                     )
-                result = second.reconcile_account(
-                    account["id"], {"confirmed": True}, "tester"
-                )
-                self.assertEqual(result["reconciled_job_count"], 1)
-                self.assertFalse(
-                    result["account"]["remote_reconciliation_required"]
+                self.assertIn(
+                    "Kaggle remote status after restart: running",
+                    "\n".join(event["message"] for event in recovered["events"]),
                 )
             finally:
                 second.close()

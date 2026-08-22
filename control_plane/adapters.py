@@ -240,7 +240,7 @@ class KaggleCliAdapter:
         self,
         executable: str | None = None,
         command_poll_seconds: float = 0.1,
-        live_log_capture_seconds: float = 3.0,
+        live_log_capture_seconds: float = 8.0,
     ):
         self.executable = executable or os.environ.get("KCP_KAGGLE_EXECUTABLE", "kaggle")
         self.command_poll_seconds = command_poll_seconds
@@ -262,6 +262,7 @@ class KaggleCliAdapter:
             command_env = dict(env)
             command_env["PYTHONIOENCODING"] = "utf-8"
             command_env["PYTHONUTF8"] = "1"
+            command_env["PYTHONUNBUFFERED"] = "1"
             try:
                 process = subprocess.Popen(
                     [self.executable, *args],
@@ -308,54 +309,109 @@ class KaggleCliAdapter:
         """
         if cancel_event.is_set():
             raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
-        with tempfile.TemporaryFile(
-            mode="w+", encoding="utf-8", errors="replace"
-        ) as output_file:
-            command_env = dict(env)
-            command_env["PYTHONIOENCODING"] = "utf-8"
-            command_env["PYTHONUTF8"] = "1"
-            try:
-                process = subprocess.Popen(
-                    [self.executable, *args],
-                    env=command_env,
-                    stdout=output_file,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    shell=False,
-                    **hidden_subprocess_kwargs(),
-                )
-            except OSError as exc:
-                raise AdapterError(f"could not start Kaggle CLI: {exc}") from exc
+        command_env = dict(env)
+        command_env["PYTHONIOENCODING"] = "utf-8"
+        command_env["PYTHONUTF8"] = "1"
+        # `kaggle kernels logs --follow` is a Python console program. Its
+        # stdout must not be buffered when Control Plane captures a bounded
+        # snapshot instead of attaching a terminal.
+        command_env["PYTHONUNBUFFERED"] = "1"
+        try:
+            process = subprocess.Popen(
+                [self.executable, *args],
+                env=command_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=0,
+                shell=False,
+                **hidden_subprocess_kwargs(),
+            )
+        except OSError as exc:
+            raise AdapterError(f"could not start Kaggle CLI: {exc}") from exc
 
-            deadline = time.monotonic() + self.live_log_capture_seconds
-            stopped_after_snapshot = False
-            while process.poll() is None and time.monotonic() < deadline:
-                remaining = max(0.0, deadline - time.monotonic())
-                if cancel_event.wait(min(self.command_poll_seconds, remaining)):
-                    process.terminate()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
-            if process.poll() is None:
-                stopped_after_snapshot = True
+        def stop_follow_process() -> None:
+            """Stop only the local CLI process tree; Kaggle keeps the kernel running.
+
+            On Windows ``kaggle.exe`` launches a Python child that can retain
+            the stdout pipe after its launcher receives ``terminate``.  A
+            process-tree stop is necessary so a bounded live-log snapshot
+            cannot pin the scheduler worker indefinitely.
+            """
+            if process.poll() is not None:
+                return
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=3,
+                        **hidden_subprocess_kwargs(),
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            else:
                 process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=2)
+                    pass
 
-            output_file.seek(0)
-            output = output_file.read().strip()
-            if not stopped_after_snapshot and process.returncode:
-                raise AdapterError(
-                    f"Kaggle CLI exited with {process.returncode}: {output[-2000:]}"
-                )
-            return output
+        # Drain continuously. A temporary output file only exposes data after
+        # the CLI flushes and can lose a partial live line when we stop its
+        # local `--follow` process. Character reads preserve exactly what the
+        # Kaggle stream has emitted without risking a pipe-buffer deadlock.
+        output_chunks: list[str] = []
+        output_lock = threading.Lock()
+
+        def drain_stdout() -> None:
+            assert process.stdout is not None
+            while True:
+                chunk = process.stdout.read(1)
+                if not chunk:
+                    return
+                with output_lock:
+                    output_chunks.append(chunk)
+
+        reader = threading.Thread(target=drain_stdout, name="kcp-live-log-reader", daemon=True)
+        reader.start()
+        deadline = time.monotonic() + self.live_log_capture_seconds
+        stopped_after_snapshot = False
+        try:
+            while process.poll() is None and time.monotonic() < deadline:
+                remaining = max(0.0, deadline - time.monotonic())
+                if cancel_event.wait(min(self.command_poll_seconds, remaining)):
+                    stop_follow_process()
+                    raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
+            if process.poll() is None:
+                stopped_after_snapshot = True
+                stop_follow_process()
+        finally:
+            # Some Windows console process trees retain the inherited write
+            # end briefly after the CLI parent exits. Never let that keep the
+            # scheduler worker blocked indefinitely. Do not close a pipe while
+            # the reader is blocked in a Windows read: TextIOWrapper.close()
+            # can itself wait for the inherited writer. The daemon owns the
+            # handle until EOF in that rare case.
+            reader.join(timeout=0.5)
+            if not reader.is_alive() and process.stdout is not None:
+                process.stdout.close()
+
+        with output_lock:
+            output = "".join(output_chunks).strip()
+        if not stopped_after_snapshot and process.returncode:
+            raise AdapterError(
+                f"Kaggle CLI exited with {process.returncode}: {output[-2000:]}"
+            )
+        return output
 
     def submit(
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event

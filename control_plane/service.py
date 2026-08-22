@@ -102,7 +102,8 @@ class ControlPlaneService:
             else:
                 raise ValidationError("adapter_name must be fake or kaggle")
         self.adapter = adapter
-        self.recovered_jobs = self.database.recover_interrupted_jobs()
+        recovered_job_ids = self.database.recover_interrupted_jobs()
+        self.recovered_jobs = len(recovered_job_ids)
         self.scheduler = JobScheduler(
             self.database,
             self.adapter,
@@ -117,6 +118,7 @@ class ControlPlaneService:
             quota_sync_seconds=quota_sync_seconds,
             quota_start_delay_seconds=quota_start_delay_seconds,
         )
+        self._reconcile_recovered_jobs(recovered_job_ids)
         if start_scheduler:
             self.scheduler.start()
 
@@ -131,6 +133,130 @@ class ControlPlaneService:
             "scheduler": self.scheduler.snapshot(),
             "recovered_jobs_on_start": self.recovered_jobs,
         }
+
+    def _reconcile_recovered_jobs(self, job_ids: list[str]) -> None:
+        """Refresh the true Kaggle state for jobs active when the app closed.
+
+        This runs before the scheduler accepts new work, so an existing remote
+        kernel never appears as a fabricated failure nor loses its account
+        concurrency guard.  A temporary CLI/network error leaves the job
+        active and marked uncertain; a later restart or explicit status query
+        can safely retry the check.
+        """
+        for job_id in job_ids:
+            env: dict[str, str] | None = None
+            try:
+                job = self.database.get_job(job_id)
+                account = self.database.get_account(job["account_id"])
+                credential_ref = account.get("credential_env_ref")
+                if not credential_ref:
+                    raise ValidationError("assigned account has no credential reference")
+                config_dir = (self.scheduler.config_root / f"recovery-{job_id}").resolve()
+                config_dir.mkdir(parents=True, exist_ok=True)
+                env = self.vault.build_subprocess_env(
+                    credential_ref, account["kaggle_username"], config_dir
+                )
+                remote = self.adapter.status(job, env, threading.Event())
+                safe_detail = self.scheduler._redact(remote.detail, env)
+                self.database.append_job_event(
+                    job_id,
+                    f"Kaggle remote status after restart: {remote.state}",
+                    details={"detail": safe_detail},
+                    level="error" if remote.state == "failed" else "info",
+                )
+                active_states = {"submitting", "submitted", "running", "cancel_requested"}
+                if remote.state == "running":
+                    self.database.transition_job(
+                        job_id,
+                        active_states,
+                        "running",
+                        fields={"error": None, "remote_may_be_running": 1},
+                    )
+                elif remote.state == "complete":
+                    output = self.scheduler._redact(
+                        self.adapter.output(job, env, threading.Event()), env
+                    )
+                    self.database.transition_job(
+                        job_id,
+                        active_states,
+                        "succeeded",
+                        fields={
+                            "error": None,
+                            "remote_may_be_running": 0,
+                            "result": {
+                                "recovered_after_restart": True,
+                                "remote_status": safe_detail,
+                                "output": output,
+                            },
+                        },
+                    )
+                elif remote.state == "failed":
+                    failure_output: dict[str, Any] | None = None
+                    try:
+                        failure_output = self.scheduler._redact(
+                            self.adapter.diagnostics(job, env, threading.Event()), env
+                        )
+                        self.scheduler._redact_downloaded_text_files(failure_output, env)
+                    except Exception as exc:
+                        self.database.append_job_event(
+                            job_id,
+                            "Could not download failed Kaggle kernel diagnostics after restart",
+                            details={"error": self.scheduler._redact(str(exc), env)[:2000]},
+                            level="warning",
+                        )
+                    result: dict[str, Any] = {
+                        "recovered_after_restart": True,
+                        "remote_status": safe_detail,
+                    }
+                    if failure_output is not None:
+                        result["failure_output"] = failure_output
+                    self.database.transition_job(
+                        job_id,
+                        active_states,
+                        "failed",
+                        fields={
+                            "error": safe_detail or "Kaggle reported failure",
+                            "remote_may_be_running": 0,
+                            "result": result,
+                        },
+                    )
+                elif remote.state == "cancelled":
+                    self.database.transition_job(
+                        job_id,
+                        active_states,
+                        "cancelled",
+                        fields={
+                            "error": safe_detail or "Kaggle reported cancellation",
+                            "remote_may_be_running": 0,
+                            "result": {
+                                "recovered_after_restart": True,
+                                "remote_status": safe_detail,
+                            },
+                        },
+                    )
+                # Kaggle may briefly report queued. ``submitted`` remains the
+                # local representation of a successfully submitted kernel.
+                elif remote.state == "queued":
+                    self.database.transition_job(
+                        job_id,
+                        active_states,
+                        "submitted",
+                        fields={"error": None, "remote_may_be_running": 1},
+                    )
+                else:
+                    self.database.append_job_event(
+                        job_id,
+                        "Kaggle returned an unrecognised state after restart; keeping job active",
+                        details={"remote_state": remote.state, "detail": safe_detail},
+                        level="warning",
+                    )
+            except Exception as exc:
+                self.database.append_job_event(
+                    job_id,
+                    "Could not reconcile Kaggle state after restart; keeping job active",
+                    details={"error": self.scheduler._redact(str(exc), env)[:2000]},
+                    level="warning",
+                )
 
     @staticmethod
     def _decorate_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -584,6 +710,47 @@ class ControlPlaneService:
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         return self._decorate_job(self.database.get_job(job_id))
+
+    def remote_job_status(self, job_id: str) -> dict[str, Any]:
+        """Read the remote Kaggle state for an interrupted local monitor.
+
+        Authentication is resolved only by the in-process credential vault and
+        is passed directly to the adapter's short-lived child process.  The
+        response is redacted before it crosses the local HTTP boundary.
+        """
+        job = self.database.get_job(job_id)
+        account = self.database.get_account(job["account_id"])
+        credential_ref = account.get("credential_env_ref")
+        if not credential_ref:
+            raise ValidationError("assigned account has no credential reference")
+        config_dir = (self.scheduler.config_root / f"status-{job_id}").resolve()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        env = self.vault.build_subprocess_env(
+            credential_ref, account["kaggle_username"], config_dir
+        )
+        remote = self.adapter.status(job, env, threading.Event())
+        result = {
+            "job_id": job_id,
+            "kernel_slug": job["kernel_slug"],
+            "remote_state": remote.state,
+            "detail": self.scheduler._redact(remote.detail, env),
+        }
+        if remote.state == "failed":
+            diagnostic = self.adapter.diagnostics(job, env, threading.Event())
+            files = diagnostic.get("files", [])
+            log_tail = ""
+            if isinstance(files, list) and files:
+                log_path = Path(job["output_dir"]).resolve() / str(files[0])
+                if log_path.is_file():
+                    log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-20000:]
+            result["diagnostic"] = {
+                "files": files,
+                "log_tail": self.scheduler._redact(log_tail, env),
+            }
+        elif remote.state == "complete":
+            output = self.adapter.output(job, env, threading.Event())
+            result["output"] = self.scheduler._redact(output, env)
+        return result
 
     def cancel_job(self, job_id: str, actor: str) -> dict[str, Any]:
         job, semantics = self.database.request_cancel(job_id, actor)

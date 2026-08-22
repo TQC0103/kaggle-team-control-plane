@@ -235,6 +235,9 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/jobs/([^/]+)", path)
         if match and method == "GET":
             return 200, {"job": service.get_job(match.group(1))}
+        match = re.fullmatch(r"/api/jobs/([^/]+)/remote-status", path)
+        if match and method == "GET":
+            return 200, service.remote_job_status(match.group(1))
         match = re.fullmatch(r"/api/jobs/([^/]+)/cancel", path)
         if match and method == "POST":
             return 202, service.cancel_job(match.group(1), actor)

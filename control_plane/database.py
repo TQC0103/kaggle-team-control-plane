@@ -390,9 +390,13 @@ class Database:
         account = dict(account)
         account_id = account["id"]
         with self.connection() as connection:
+            # After a Control Plane restart, an active job can still be running
+            # on Kaggle even though there is no in-process scheduler worker for
+            # it yet. Treat that as unresolved as well: otherwise a restart
+            # could allow two more GPU submissions and exceed the account's
+            # actual remote concurrency.
             unresolved = connection.execute(
                 "SELECT 1 FROM jobs WHERE account_id=? "
-                "AND status IN ('succeeded','failed','cancelled') "
                 "AND remote_may_be_running=1 LIMIT 1",
                 (account_id,),
             ).fetchone()
@@ -821,7 +825,14 @@ class Database:
             )
         return self.get_job(retry_id)
 
-    def recover_interrupted_jobs(self) -> int:
+    def recover_interrupted_jobs(self) -> list[str]:
+        """Preserve active remote jobs for startup reconciliation.
+
+        Closing the desktop app only stops the local monitor; it does not stop
+        a Kaggle kernel.  Do not manufacture a local ``failed`` result here.
+        The service reconciles these ids with Kaggle after its scheduler and
+        credential vault are ready.
+        """
         now = utc_now()
         placeholders = ",".join("?" for _ in ACTIVE_JOB_STATES)
         with self.connection() as connection:
@@ -831,18 +842,18 @@ class Database:
             ).fetchall()
             for row in rows:
                 connection.execute(
-                    "UPDATE jobs SET status='failed', remote_may_be_running=1, "
-                    "error=?, finished_at=?, updated_at=? WHERE id=?",
+                    "UPDATE jobs SET status=CASE WHEN status='submitting' "
+                    "THEN 'submitted' ELSE status END, remote_may_be_running=1, "
+                    "error=?, finished_at=NULL, updated_at=? WHERE id=?",
                     (
-                        "control plane restarted while this job was active; verify Kaggle remotely",
-                        now,
+                        "control plane restarted; reconciling remote Kaggle status",
                         now,
                         row["id"],
                     ),
                 )
                 self.append_audit(
                     "scheduler",
-                    "job.recovered_as_failed",
+                    "job.recovery_pending",
                     "job",
                     row["id"],
                     {"previous_status": row["status"]},
@@ -850,11 +861,11 @@ class Database:
                 )
                 self.append_job_event(
                     row["id"],
-                    "Control plane restarted; verify the remote Kaggle run",
-                    level="error",
+                    "Control plane restarted; reconciling the remote Kaggle run",
+                    level="warning",
                     connection=connection,
                 )
-        return len(rows)
+        return [str(row["id"]) for row in rows]
 
     def list_audit(
         self,
