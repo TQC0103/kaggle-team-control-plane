@@ -53,3 +53,16 @@ Do not load both references unless the task genuinely spans both modes.
 Use the laptop for unit tests, formatting, schema validation, dataset parsing,
 and short smoke checks only. Use Control Plane for embeddings, batch model
 evaluation, training, and other GPU-heavy work.
+
+## Persistent chained benchmarks
+
+For a long benchmark that must continue across Kaggle runtimes, use a small
+local chain runner outside submitted source bundles. Its state must be written
+atomically under the Control Plane runtime directory, contain the predecessor
+job ID/kernel/target and immutable data source, and be restart-safe. A runner
+may submit only after the predecessor is `succeeded` and the downloaded
+artifact contains a nonempty `resume_latest` checkpoint plus metric history.
+For each successor, create a new versioned experiment bundle, attach the
+previous kernel output and original data source, retain an isolated venv, and
+carry checkpoint frequency/full RNG state forward. Stop on `failed` or
+`cancelled`; never retry or skip a chunk automatically.
