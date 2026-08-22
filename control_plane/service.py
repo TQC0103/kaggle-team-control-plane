@@ -188,9 +188,9 @@ class ControlPlaneService:
                         fields={"error": None, "remote_may_be_running": 1},
                     )
                 elif remote.state == "complete":
-                    output = self.scheduler._redact(
-                        self.adapter.output(job, env, threading.Event()), env
-                    )
+                    # Remote status is authoritative. Persist it before
+                    # downloading artifacts: an output transfer can be slow,
+                    # but it must not make a completed Kaggle job look active.
                     self.database.transition_job(
                         job_id,
                         active_states,
@@ -201,30 +201,34 @@ class ControlPlaneService:
                             "result": {
                                 "recovered_after_restart": True,
                                 "remote_status": safe_detail,
-                                "output": output,
+                                "output_pending": True,
                             },
                         },
                     )
-                elif remote.state == "failed":
-                    failure_output: dict[str, Any] | None = None
                     try:
-                        failure_output = self.scheduler._redact(
-                            self.adapter.diagnostics(job, env, threading.Event()), env
+                        output = self.scheduler._redact(
+                            self.adapter.output(job, env, threading.Event()), env
                         )
-                        self.scheduler._redact_downloaded_text_files(failure_output, env)
+                        self.database.transition_job(
+                            job_id,
+                            {"succeeded"},
+                            "succeeded",
+                            fields={
+                                "result": {
+                                    "recovered_after_restart": True,
+                                    "remote_status": safe_detail,
+                                    "output": output,
+                                }
+                            },
+                        )
                     except Exception as exc:
                         self.database.append_job_event(
                             job_id,
-                            "Could not download failed Kaggle kernel diagnostics after restart",
+                            "Could not download completed Kaggle output after restart",
                             details={"error": self.scheduler._redact(str(exc), env)[:2000]},
                             level="warning",
                         )
-                    result: dict[str, Any] = {
-                        "recovered_after_restart": True,
-                        "remote_status": safe_detail,
-                    }
-                    if failure_output is not None:
-                        result["failure_output"] = failure_output
+                elif remote.state == "failed":
                     self.database.transition_job(
                         job_id,
                         active_states,
@@ -232,9 +236,37 @@ class ControlPlaneService:
                         fields={
                             "error": safe_detail or "Kaggle reported failure",
                             "remote_may_be_running": 0,
-                            "result": result,
+                            "result": {
+                                "recovered_after_restart": True,
+                                "remote_status": safe_detail,
+                                "diagnostics_pending": True,
+                            },
                         },
                     )
+                    try:
+                        failure_output = self.scheduler._redact(
+                            self.adapter.diagnostics(job, env, threading.Event()), env
+                        )
+                        self.scheduler._redact_downloaded_text_files(failure_output, env)
+                        self.database.transition_job(
+                            job_id,
+                            {"failed"},
+                            "failed",
+                            fields={
+                                "result": {
+                                    "recovered_after_restart": True,
+                                    "remote_status": safe_detail,
+                                    "failure_output": failure_output,
+                                }
+                            },
+                        )
+                    except Exception as exc:
+                        self.database.append_job_event(
+                            job_id,
+                            "Could not download failed Kaggle kernel diagnostics after restart",
+                            details={"error": self.scheduler._redact(str(exc), env)[:2000]},
+                            level="warning",
+                        )
                 elif remote.state == "cancelled":
                     self.database.transition_job(
                         job_id,
