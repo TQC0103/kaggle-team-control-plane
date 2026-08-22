@@ -251,6 +251,8 @@ class KaggleCliAdapter:
         args: list[str],
         env: dict[str, str],
         cancel_event: threading.Event,
+        *,
+        timeout_seconds: float | None = None,
     ) -> str:
         if cancel_event.is_set():
             raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
@@ -277,6 +279,11 @@ class KaggleCliAdapter:
                 )
             except OSError as exc:
                 raise AdapterError(f"could not start Kaggle CLI: {exc}") from exc
+            deadline = (
+                time.monotonic() + timeout_seconds
+                if timeout_seconds is not None
+                else None
+            )
             while process.poll() is None:
                 if cancel_event.wait(self.command_poll_seconds):
                     process.terminate()
@@ -285,6 +292,28 @@ class KaggleCliAdapter:
                     except subprocess.TimeoutExpired:
                         process.kill()
                     raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
+                if deadline is not None and time.monotonic() >= deadline:
+                    if os.name == "nt":
+                        try:
+                            subprocess.run(
+                                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                                timeout=3,
+                                **hidden_subprocess_kwargs(),
+                            )
+                        except (OSError, subprocess.TimeoutExpired):
+                            pass
+                    else:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    raise AdapterError(
+                        f"Kaggle CLI timed out after {timeout_seconds:.0f}s: {' '.join(args[:3])}"
+                    )
             output_file.seek(0)
             output = output_file.read().strip()
             if process.returncode:
@@ -443,7 +472,10 @@ class KaggleCliAdapter:
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> RemoteStatus:
         output = self._run(
-            ["kernels", "status", job["kernel_slug"]], env, cancel_event
+            ["kernels", "status", job["kernel_slug"]],
+            env,
+            cancel_event,
+            timeout_seconds=20,
         )
         normalized = output.casefold()
         if any(word in normalized for word in ("error", "failed", "failure")):
