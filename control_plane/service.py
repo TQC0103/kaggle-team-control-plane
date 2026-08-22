@@ -118,9 +118,24 @@ class ControlPlaneService:
             quota_sync_seconds=quota_sync_seconds,
             quota_start_delay_seconds=quota_start_delay_seconds,
         )
-        self._reconcile_recovered_jobs(recovered_job_ids)
         if start_scheduler:
             self.scheduler.start()
+            # A Kaggle CLI status command can be slow or temporarily blocked.
+            # Never make the desktop API/UI wait for that remote round trip.
+            # The preserved active state is already safe, and the scheduler
+            # will not dispatch onto its account while it is unresolved.
+            self._recovery_thread = threading.Thread(
+                target=self._reconcile_recovered_jobs,
+                args=(recovered_job_ids,),
+                name="kcp-startup-remote-reconciliation",
+                daemon=True,
+            )
+            self._recovery_thread.start()
+        else:
+            # Deterministic service construction is useful for the backend
+            # suite and other non-desktop callers.
+            self._recovery_thread = None
+            self._reconcile_recovered_jobs(recovered_job_ids)
 
     def close(self) -> None:
         self.scheduler.close()
