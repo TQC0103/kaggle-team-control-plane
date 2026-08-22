@@ -1069,6 +1069,68 @@ class SchedulerTests(unittest.TestCase):
             finally:
                 second.close()
 
+    def test_restart_recovers_legacy_restart_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = make_source(root, "legacy-restart-source")
+            database_path = root / "state.sqlite3"
+            vault = EnvCredentialVault({"ACCOUNT_TOKEN": "token"})
+            first = ControlPlaneService(
+                database_path,
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=FakeKaggleAdapter(),
+                vault=vault,
+                start_scheduler=False,
+            )
+            try:
+                account = first.create_account(
+                    account_payload("legacy-restart-user", "ACCOUNT_TOKEN"), "tester"
+                )
+                batch = first.create_batch(
+                    {
+                        "name": "legacy restart failure",
+                        "jobs": [
+                            {
+                                "account_id": account["id"],
+                                "experiment_name": "legacy restart failure",
+                                "source_dir": str(source),
+                                "kernel_slug": "legacy-restart-run",
+                            }
+                        ],
+                    },
+                    "tester",
+                )
+                job_id = batch["jobs"][0]["id"]
+                with first.database.connection() as connection:
+                    connection.execute(
+                        "UPDATE jobs SET status='failed', remote_may_be_running=0, "
+                        "error=? WHERE id=?",
+                        (
+                            "control plane restarted while this job was active; "
+                            "verify Kaggle remotely",
+                            job_id,
+                        ),
+                    )
+            finally:
+                first.close()
+
+            second = ControlPlaneService(
+                database_path,
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=FakeKaggleAdapter(),
+                vault=vault,
+                start_scheduler=False,
+            )
+            try:
+                self.assertEqual(second.recovered_jobs, 1)
+                recovered = second.get_job(job_id)
+                self.assertEqual(recovered["status"], "running")
+                self.assertTrue(recovered["remote_may_be_running"])
+            finally:
+                second.close()
+
     def test_disable_does_not_cancel_active_job_but_blocks_new_work(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

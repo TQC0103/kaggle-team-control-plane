@@ -16,6 +16,9 @@ from .errors import ConflictError, NotFoundError
 
 TERMINAL_JOB_STATES = {"succeeded", "failed", "cancelled"}
 ACTIVE_JOB_STATES = {"submitting", "submitted", "running", "cancel_requested"}
+LEGACY_RESTART_FAILURE = (
+    "control plane restarted while this job was active; verify Kaggle remotely"
+)
 
 
 def utc_now() -> str:
@@ -837,12 +840,13 @@ class Database:
         placeholders = ",".join("?" for _ in ACTIVE_JOB_STATES)
         with self.connection() as connection:
             rows = connection.execute(
-                f"SELECT id,status FROM jobs WHERE status IN ({placeholders})",  # noqa: S608
-                sorted(ACTIVE_JOB_STATES),
+                f"SELECT id,status FROM jobs WHERE status IN ({placeholders}) "  # noqa: S608
+                "OR (status='failed' AND error=?)",
+                (*sorted(ACTIVE_JOB_STATES), LEGACY_RESTART_FAILURE),
             ).fetchall()
             for row in rows:
                 connection.execute(
-                    "UPDATE jobs SET status=CASE WHEN status='submitting' "
+                    "UPDATE jobs SET status=CASE WHEN status IN ('submitting','failed') "
                     "THEN 'submitted' ELSE status END, remote_may_be_running=1, "
                     "error=?, finished_at=NULL, updated_at=? WHERE id=?",
                     (
