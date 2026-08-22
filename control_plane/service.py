@@ -124,17 +124,23 @@ class ControlPlaneService:
             # Never make the desktop API/UI wait for that remote round trip.
             # The preserved active state is already safe, and the scheduler
             # will not dispatch onto its account while it is unresolved.
-            self._recovery_thread = threading.Thread(
-                target=self._reconcile_recovered_jobs,
-                args=(recovered_job_ids,),
-                name="kcp-startup-remote-reconciliation",
-                daemon=True,
-            )
-            self._recovery_thread.start()
+            self._recovery_threads: list[threading.Thread] = []
+            # Keep every recovery independent. A slow artifact download from
+            # one completed kernel must not delay status reconciliation for a
+            # different remote kernel.
+            for job_id in recovered_job_ids:
+                thread = threading.Thread(
+                    target=self._reconcile_recovered_jobs,
+                    args=([job_id],),
+                    name=f"kcp-startup-remote-reconciliation-{job_id[-8:]}",
+                    daemon=True,
+                )
+                thread.start()
+                self._recovery_threads.append(thread)
         else:
             # Deterministic service construction is useful for the backend
             # suite and other non-desktop callers.
-            self._recovery_thread = None
+            self._recovery_threads = []
             self._reconcile_recovered_jobs(recovered_job_ids)
 
     def close(self) -> None:
