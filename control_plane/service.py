@@ -802,7 +802,39 @@ class ControlPlaneService:
             }
         elif remote.state == "complete":
             output = self.adapter.output(job, env, threading.Event())
-            result["output"] = self.scheduler._redact(output, env)
+            safe_output = self.scheduler._redact(output, env)
+            result["output"] = safe_output
+            # An on-demand status check can be the first successful query after
+            # a transient scheduler timeout.  It has already downloaded the
+            # output above, so leave the persisted job in the same terminal
+            # state as the normal scheduler path.  Without this transition the
+            # UI says "submitted" even though artifacts exist, and a durable
+            # chained benchmark can never submit its successor.
+            stored = self.database.get_job(job_id)
+            if stored["status"] in {"submitted", "running"}:
+                prior_result = stored.get("result") or {}
+                completed_result = {
+                    "submit": prior_result.get("submit"),
+                    "remote_status": result["detail"],
+                    "output": safe_output,
+                }
+                if completed_result["submit"] is None:
+                    completed_result.pop("submit")
+                changed = self.database.transition_job(
+                    job_id,
+                    {"submitted", "running"},
+                    "succeeded",
+                    fields={"result": completed_result, "error": None},
+                )
+                if changed:
+                    self.database.append_job_event(
+                        job_id,
+                        "Persisted completed Kaggle status after on-demand check",
+                        details={
+                            "output_dir": safe_output.get("output_dir"),
+                            "file_count": len(safe_output.get("files", [])),
+                        },
+                    )
         return result
 
     def cancel_job(self, job_id: str, actor: str) -> dict[str, Any]:
