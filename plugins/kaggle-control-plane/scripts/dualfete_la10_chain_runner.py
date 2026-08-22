@@ -114,6 +114,16 @@ def successor_source(state: dict[str, Any], target: int) -> tuple[Path, str]:
         if anchor not in run:
             raise RuntimeError("unable to add official final evaluation")
         run = run.replace(anchor, final_eval, 1)
+    cleanup_anchor = '    shutil.copytree(repo / "model", ROOT / "model", dirs_exist_ok=True)'
+    cleanup = '''    # The venv is job-local and no longer needed after training/evaluation.
+    # Do not publish it as a notebook output: it delays durable checkpoint
+    # handoff by thousands of irrelevant files.
+    if VENV.exists():
+        shutil.rmtree(VENV)
+    shutil.copytree(repo / "model", ROOT / "model", dirs_exist_ok=True)'''
+    if cleanup_anchor not in run:
+        raise RuntimeError("unable to add output cleanup")
+    run = run.replace(cleanup_anchor, cleanup, 1)
     run_path.write_text(run, encoding="utf-8")
 
     metadata_path = source / "kernel-metadata.json"
