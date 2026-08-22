@@ -19,6 +19,7 @@ ACTIVE_JOB_STATES = {"submitting", "submitted", "running", "cancel_requested"}
 LEGACY_RESTART_FAILURE = (
     "control plane restarted while this job was active; verify Kaggle remotely"
 )
+STATUS_POLL_TIMEOUT_PREFIX = "Kaggle CLI timed out after"
 
 
 def utc_now() -> str:
@@ -841,8 +842,13 @@ class Database:
         with self.connection() as connection:
             rows = connection.execute(
                 f"SELECT id,status FROM jobs WHERE status IN ({placeholders}) "  # noqa: S608
-                "OR (status='failed' AND error=?)",
-                (*sorted(ACTIVE_JOB_STATES), LEGACY_RESTART_FAILURE),
+                "OR (status='failed' AND (error=? OR "
+                "(remote_may_be_running=1 AND error LIKE ?)))",
+                (
+                    *sorted(ACTIVE_JOB_STATES),
+                    LEGACY_RESTART_FAILURE,
+                    f"{STATUS_POLL_TIMEOUT_PREFIX}%",
+                ),
             ).fetchall()
             for row in rows:
                 connection.execute(

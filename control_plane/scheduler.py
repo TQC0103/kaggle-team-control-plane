@@ -524,6 +524,26 @@ class JobScheduler:
                         "cancel_requested": 1,
                     },
                 )
+            elif submit_started and safe_error.startswith("Kaggle CLI timed out after"):
+                # A bounded `kernels status` poll only tells us that the local
+                # monitor lost contact. It is not evidence that a submitted
+                # Kaggle kernel failed. Preserve the last active state and
+                # make the account conservative until a later reconciliation.
+                active_state = (
+                    current["status"]
+                    if current["status"] in {"submitted", "running"}
+                    else "submitted"
+                )
+                self.database.transition_job(
+                    job_id,
+                    ACTIVE_JOB_STATES,
+                    active_state,
+                    fields={
+                        "error": "Kaggle status poll timed out; remote execution may still be running",
+                        "remote_may_be_running": 1,
+                        "result": {"submit": submit_result} if submit_result else None,
+                    },
+                )
             else:
                 self.database.transition_job(
                     job_id,
