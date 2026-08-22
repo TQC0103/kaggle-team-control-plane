@@ -9,6 +9,7 @@ API and creates a successor after the preceding job is marked ``succeeded``
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -78,12 +79,23 @@ def require_downloaded_checkpoint(job: dict[str, Any]) -> None:
     output_dir = Path(str(job["output_dir"]))
     candidates = list(output_dir.rglob("resume_latest.pth"))
     metric_files = list(output_dir.rglob("metrics_history.json"))
-    if len(candidates) != 1 or not metric_files:
+    if not candidates or not metric_files:
         raise RuntimeError(
             f"successful predecessor artifact is incomplete: checkpoints={candidates}, metrics={metric_files}"
         )
-    if candidates[0].stat().st_size <= 0:
+    if any(candidate.stat().st_size <= 0 for candidate in candidates):
         raise RuntimeError("predecessor resume checkpoint is empty")
+    # Earlier chunks retained the cloned repository as well as the explicit
+    # handoff copy, so Kaggle publishes two identical checkpoints.  Accept
+    # only byte-identical duplicates; anything else is unsafe to resume.
+    def digest(path: Path) -> str:
+        hasher = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(block)
+        return hasher.hexdigest()
+    if len({digest(candidate) for candidate in candidates}) != 1:
+        raise RuntimeError("predecessor contains conflicting resume checkpoints")
 
 
 def successor_source(state: dict[str, Any], target: int) -> tuple[Path, str]:
@@ -124,6 +136,14 @@ def successor_source(state: dict[str, Any], target: int) -> tuple[Path, str]:
     if cleanup_anchor not in run:
         raise RuntimeError("unable to add output cleanup")
     run = run.replace(cleanup_anchor, cleanup, 1)
+    repository_cleanup_anchor = '    shutil.copy2(ROOT / "runtime.json", ROOT / "model" / "runtime.json")'
+    repository_cleanup = '''    shutil.copy2(ROOT / "runtime.json", ROOT / "model" / "runtime.json")
+    # The handoff model above is sufficient; omit the clone that otherwise
+    # publishes a duplicate checkpoint and source tree.
+    shutil.rmtree(repo)'''
+    if repository_cleanup_anchor not in run:
+        raise RuntimeError("unable to add repository output cleanup")
+    run = run.replace(repository_cleanup_anchor, repository_cleanup, 1)
     run_path.write_text(run, encoding="utf-8")
 
     metadata_path = source / "kernel-metadata.json"
