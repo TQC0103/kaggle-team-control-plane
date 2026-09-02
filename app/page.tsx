@@ -519,7 +519,7 @@ export default function Home() {
     if (!quiet) setRefreshing(true);
     const results = await Promise.allSettled([
       apiRequest("/api/accounts"),
-      apiRequest("/api/jobs"),
+      apiRequest("/api/jobs?limit=500&summary=1"),
       apiRequest("/api/audit"),
     ]);
 

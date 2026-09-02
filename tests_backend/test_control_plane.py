@@ -570,6 +570,73 @@ class SchedulerTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_definite_submit_failure_does_not_create_remote_uncertainty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database_path = root / "state.sqlite3"
+            vault = EnvCredentialVault({"SUBMIT_ACCOUNT": "token"})
+            first = ControlPlaneService(
+                database_path,
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=FakeKaggleAdapter(poll_delay_seconds=0.005),
+                vault=vault,
+                remote_poll_seconds=0.005,
+                dispatch_poll_seconds=0.005,
+            )
+            try:
+                account = first.create_account(
+                    account_payload("submit-user", "SUBMIT_ACCOUNT"), "tester"
+                )
+                batch = first.create_batch(
+                    {
+                        "name": "definite submit failure",
+                        "jobs": [{
+                            "account_id": account["id"],
+                            "experiment_name": "rejected before acceptance",
+                            "source_dir": str(make_source(root, "submit-source")),
+                            "kernel_slug": "rejected-submit",
+                            "metadata": {
+                                "fake_submit_error": "400 Client Error: Bad Request"
+                            },
+                        }],
+                    },
+                    "tester",
+                )
+                job_id = batch["jobs"][0]["id"]
+                failed = wait_for_status(first, job_id, {"failed"})
+                self.assertFalse(failed["remote_may_be_running"])
+                with first.database.connection() as connection:
+                    connection.execute(
+                        "UPDATE jobs SET status='submitted',remote_may_be_running=1,"
+                        "error='control plane restarted; reconciling remote Kaggle status',"
+                        "finished_at=NULL WHERE id=?",
+                        (job_id,),
+                    )
+            finally:
+                first.close()
+
+            second = ControlPlaneService(
+                database_path,
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=FakeKaggleAdapter(),
+                vault=vault,
+                start_scheduler=False,
+            )
+            try:
+                self.assertEqual(second.recovered_jobs, 0)
+                repaired = second.get_job(job_id)
+                self.assertEqual(repaired["status"], "failed")
+                self.assertFalse(repaired["remote_may_be_running"])
+                self.assertTrue(any(
+                    event["message"]
+                    == "Repaired legacy submit failure; no remote Kaggle run was accepted"
+                    for event in repaired["events"]
+                ))
+            finally:
+                second.close()
+
     def test_remote_log_lines_survive_large_snapshot_and_paginate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1791,6 +1858,29 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(result["status"], "succeeded")
                 self.assertEqual(
                     result["result"]["output"]["fake_result"]["metric"], 7
+                )
+                status, summaries, _ = request(
+                    "GET", "/api/jobs?status=succeeded&limit=1&summary=1"
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(len(summaries["jobs"]), 1)
+                self.assertEqual(summaries["jobs"][0]["id"], job_id)
+                self.assertNotIn("result", summaries["jobs"][0])
+                status, stats, _ = request("GET", "/api/jobs/stats")
+                self.assertEqual(status, 200)
+                self.assertEqual(stats["states"], {"succeeded": 1})
+                status, compact, _ = request(
+                    "GET",
+                    f"/api/jobs/{job_id}?include_remote_logs=0&event_limit=1",
+                )
+                self.assertEqual(status, 200)
+                self.assertLessEqual(len(compact["job"]["events"]), 1)
+                self.assertNotIn("remote_logs", compact["job"])
+                status, invalid_limit, _ = request("GET", "/api/jobs?limit=0")
+                self.assertEqual(status, 422)
+                self.assertEqual(
+                    invalid_limit["error"]["message"],
+                    "job limit must be between 1 and 1000",
                 )
                 status, audit, _ = request("GET", "/api/audit?limit=20")
                 self.assertEqual(status, 200)

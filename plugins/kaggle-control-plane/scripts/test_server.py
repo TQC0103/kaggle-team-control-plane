@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -31,10 +32,35 @@ def test_redaction() -> None:
 def test_status_summary() -> None:
     responses = [
         ({"accounts": [{"id": "a"}]}, {}),
-        ({"jobs": [{"status": "succeeded"}, {"status": "failed"}]}, {}),
+        ({"states": {"succeeded": 1, "failed": 1}}, {}),
     ]
     with mock.patch.object(SERVER, "_request", side_effect=responses):
         assert SERVER._call("kcp_status", {})["job_states"] == {"succeeded": 1, "failed": 1}
+
+
+def test_list_jobs_uses_server_side_bounds_and_filters() -> None:
+    with mock.patch.object(
+        SERVER, "_request", return_value=({"jobs": [{"id": "job_1"}]}, {})
+    ) as request:
+        result = SERVER._call("kcp_list_jobs", {"status": "submitted", "limit": 7})
+
+    assert result == [{"id": "job_1"}]
+    path = request.call_args.args[0]
+    assert path.startswith("/api/jobs?")
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+    assert query == {"limit": ["7"], "summary": ["1"], "status": ["submitted"]}
+
+
+def test_get_job_requests_compact_detail() -> None:
+    with mock.patch.object(
+        SERVER, "_request", return_value=({"job": {"id": "job_1"}}, {})
+    ) as request:
+        result = SERVER._call("kcp_get_job", {"job_id": "job_1"})
+
+    assert result == {"job": {"id": "job_1"}}
+    path = request.call_args.args[0]
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+    assert query == {"include_remote_logs": ["0"], "event_limit": ["100"]}
 
 
 def test_submit_requires_notebook_folder(tmp_path: Path) -> None:
@@ -75,7 +101,13 @@ def test_submit_maps_accelerator_to_backend_metadata(tmp_path: Path) -> None:
 
 
 if __name__ == "__main__":
-    tests = [test_initialize_and_tools, test_redaction, test_status_summary]
+    tests = [
+        test_initialize_and_tools,
+        test_redaction,
+        test_status_summary,
+        test_list_jobs_uses_server_side_bounds_and_filters,
+        test_get_job_requests_compact_detail,
+    ]
     for test in tests:
         test()
     print(json.dumps({"passed": len(tests)}))

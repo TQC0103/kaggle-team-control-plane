@@ -749,21 +749,29 @@ class Database:
         return [self.get_batch(row["id"]) for row in rows]
 
     def get_job(
-        self, job_id: str, *, include_remote_logs: bool = False
+        self,
+        job_id: str,
+        *,
+        include_remote_logs: bool = False,
+        event_limit: int = 200,
+        remote_log_limit: int = 500,
     ) -> dict[str, Any]:
         with self.connection() as connection:
             row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         job = self._decode(row, "job")
         if not job:
             raise NotFoundError(f"job {job_id!r} was not found")
-        job["events"] = self.list_job_events(job_id)
+        job["events"] = self.list_job_events(job_id, limit=event_limit)
         # Scheduler paths call ``get_job`` frequently.  Do not load a large
         # live-output page for every poll; the run-detail API explicitly opts
         # in below.  Fetch one sentinel line to make the UI pagination state
         # exact instead of guessing from a page that happens to be full.
         if include_remote_logs:
-            remote_logs = self.list_remote_log_lines(job_id, limit=501)
-            has_more = len(remote_logs) > 500
+            bounded_log_limit = max(1, min(remote_log_limit, 500))
+            remote_logs = self.list_remote_log_lines(
+                job_id, limit=bounded_log_limit + 1
+            )
+            has_more = len(remote_logs) > bounded_log_limit
             if has_more:
                 remote_logs = remote_logs[1:]
             job["remote_logs"] = remote_logs
@@ -779,9 +787,10 @@ class Database:
         batch_id: str | None = None,
         account_id: str | None = None,
         status: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         filters: list[str] = []
-        params: list[str] = []
+        params: list[Any] = []
         for column, value in (
             ("batch_id", batch_id),
             ("account_id", account_id),
@@ -791,12 +800,26 @@ class Database:
                 filters.append(f"{column} = ?")
                 params.append(value)
         where = " WHERE " + " AND ".join(filters) if filters else ""
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = " LIMIT ?"
+            params.append(max(1, min(limit, 1000)))
         with self.connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM jobs" + where + " ORDER BY created_at DESC, rowid DESC",
+                "SELECT * FROM jobs"
+                + where
+                + " ORDER BY created_at DESC, rowid DESC"
+                + limit_clause,
                 params,
             ).fetchall()
         return [self._decode(row, "job") for row in rows]  # type: ignore[misc]
+
+    def job_state_counts(self) -> dict[str, int]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM jobs GROUP BY status"
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
 
     def queued_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.connection() as connection:
@@ -960,6 +983,43 @@ class Database:
         """
         now = utc_now()
         with self.connection() as connection:
+            # Older schedulers marked any attempted submit as remotely
+            # uncertain, even when Kaggle returned a definite client error.
+            # Repair only rows whose immutable event trace proves that a
+            # failure was persisted before any successful submit event.
+            legacy_rejected = connection.execute(
+                "SELECT jobs.id FROM jobs WHERE remote_may_be_running=1 "
+                "AND (result_json IS NULL OR result_json='null') "
+                "AND EXISTS (SELECT 1 FROM job_events WHERE job_id=jobs.id "
+                "AND message='Job status changed to failed') "
+                "AND NOT EXISTS (SELECT 1 FROM job_events WHERE job_id=jobs.id "
+                "AND message='Submitted the staged kernel to Kaggle')"
+            ).fetchall()
+            for row in legacy_rejected:
+                connection.execute(
+                    "UPDATE jobs SET status='failed',remote_may_be_running=0,"
+                    "error=?,finished_at=COALESCE(finished_at,?),updated_at=? WHERE id=?",
+                    (
+                        "legacy submit failure; Kaggle did not accept a remote kernel",
+                        now,
+                        now,
+                        row["id"],
+                    ),
+                )
+                self.append_audit(
+                    "scheduler",
+                    "job.legacy_submit_failure_repaired",
+                    "job",
+                    row["id"],
+                    {"remote_submission_confirmed": False},
+                    connection=connection,
+                )
+                self.append_job_event(
+                    row["id"],
+                    "Repaired legacy submit failure; no remote Kaggle run was accepted",
+                    level="warning",
+                    connection=connection,
+                )
             rows = connection.execute(
                 "SELECT id,status FROM jobs WHERE status IN "
                 "('submitting','submitted','running','cancel_requested') "

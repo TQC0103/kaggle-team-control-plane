@@ -665,6 +665,9 @@ class FakeKaggleAdapter:
     ) -> dict[str, Any]:
         if cancel_event.is_set():
             raise LocalCommandCancelled("fake submit cancelled")
+        submit_error = job["metadata"].get("fake_submit_error")
+        if submit_error:
+            raise AdapterError(str(submit_error))
         with self._lock:
             self._in_flight += 1
             self._active_remote_jobs.add(job["id"])

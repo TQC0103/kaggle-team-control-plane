@@ -1,5 +1,7 @@
 # Kaggle Team Control Plane
 
+[![CI](https://github.com/TQC0103/kaggle-team-control-plane/actions/workflows/ci.yml/badge.svg)](https://github.com/TQC0103/kaggle-team-control-plane/actions/workflows/ci.yml)
+
 Round-1 MVP for running experiments from one Windows computer across a flexible
 registry of explicitly assigned, owner-consented Kaggle accounts. A human operator and
 an agent share the same account registry, parallel queue, job state, logs,
@@ -290,7 +292,10 @@ GET   /api/batches
 POST  /api/batches
 GET   /api/batches/{id}
 GET   /api/jobs
+GET   /api/jobs?status=submitted&limit=20&summary=1
+GET   /api/jobs/stats
 GET   /api/jobs/{id}
+GET   /api/jobs/{id}?include_remote_logs=0&event_limit=100
 POST  /api/jobs/{id}/cancel
 POST  /api/jobs/{id}/retry
 GET   /api/jobs/{id}/result
@@ -330,10 +335,15 @@ if ($errors.Count) { $errors; exit 1 }
 
 python -m py_compile scripts\demo_server.py scripts\verify_demo.py
 python -m unittest discover -s tests_backend -v
+python -m unittest discover -s tests_desktop -v
 python -m unittest discover -s agent_interface/tests -v
+python -m pytest plugins\kaggle-control-plane\scripts\test_server.py -q
 npm run lint
 npm test
 ```
+
+Pull requests and pushes to `main` run the same checks on GitHub Actions for
+Windows, the supported desktop platform.
 
 Real Kaggle execution still depends on each account's current limits,
 accelerator availability, network health, and Kaggle service behavior.

@@ -743,7 +743,10 @@ class JobScheduler:
                     "failed",
                     fields={
                         "error": safe_error,
-                        "remote_may_be_running": 1 if submit_started else 0,
+                        # Reaching the CLI is not the same as Kaggle accepting
+                        # a kernel. A definite submit error (for example HTTP
+                        # 400) must not create a permanent remote uncertainty.
+                        "remote_may_be_running": 1 if submitted else 0,
                         "result": {"submit": submit_result} if submit_result else None,
                     },
                 )

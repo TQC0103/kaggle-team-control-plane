@@ -850,16 +850,42 @@ class ControlPlaneService:
         batch_id: str | None = None,
         account_id: str | None = None,
         status: str | None = None,
+        limit: int | None = None,
+        summary: bool = False,
     ) -> list[dict[str, Any]]:
-        return [
+        jobs = [
             self._decorate_job(job)
             for job in self.database.list_jobs(
-                batch_id=batch_id, account_id=account_id, status=status
+                batch_id=batch_id,
+                account_id=account_id,
+                status=status,
+                limit=limit,
             )
         ]
+        if summary:
+            for job in jobs:
+                job.pop("result", None)
+        return jobs
 
-    def get_job(self, job_id: str) -> dict[str, Any]:
-        return self._decorate_job(self.database.get_job(job_id, include_remote_logs=True))
+    def job_state_counts(self) -> dict[str, int]:
+        return self.database.job_state_counts()
+
+    def get_job(
+        self,
+        job_id: str,
+        *,
+        include_remote_logs: bool = True,
+        event_limit: int = 200,
+        remote_log_limit: int = 500,
+    ) -> dict[str, Any]:
+        return self._decorate_job(
+            self.database.get_job(
+                job_id,
+                include_remote_logs=include_remote_logs,
+                event_limit=event_limit,
+                remote_log_limit=remote_log_limit,
+            )
+        )
 
     def job_remote_logs_page(
         self, job_id: str, *, before_id: int | None = None, limit: int = 200

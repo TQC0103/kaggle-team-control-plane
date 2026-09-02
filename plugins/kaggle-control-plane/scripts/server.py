@@ -47,7 +47,19 @@ TOOLS = [
         "description": "List recent Control Plane jobs, optionally filtered by status.",
         "inputSchema": _schema(
             {
-                "status": {"type": "string", "enum": ["queued", "running", "succeeded", "failed", "cancelled"]},
+                "status": {
+                    "type": "string",
+                    "enum": [
+                        "queued",
+                        "submitting",
+                        "submitted",
+                        "running",
+                        "cancel_requested",
+                        "succeeded",
+                        "failed",
+                        "cancelled",
+                    ],
+                },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
             }
         ),
@@ -232,25 +244,27 @@ def _call(name: str, arguments: dict[str, Any]) -> Any:
         payload, _ = _request("/api/accounts")
         return _safe(payload)
     if name == "kcp_list_jobs":
-        payload, _ = _request("/api/jobs")
+        query = {
+            "limit": int(arguments.get("limit", 20)),
+            "summary": 1,
+        }
+        if arguments.get("status"):
+            query["status"] = arguments["status"]
+        payload, _ = _request(f"/api/jobs?{urllib.parse.urlencode(query)}")
         jobs = _items(payload, "jobs", "runs", "items", "data")
-        status = arguments.get("status")
-        if status:
-            jobs = [job for job in jobs if isinstance(job, dict) and job.get("status") == status]
-        return _safe(jobs[: int(arguments.get("limit", 20))])
+        return _safe(jobs)
     if name == "kcp_status":
         accounts_payload, _ = _request("/api/accounts")
-        jobs_payload, _ = _request("/api/jobs")
+        stats_payload, _ = _request("/api/jobs/stats")
         accounts = _items(accounts_payload, "accounts", "items", "data")
-        jobs = _items(jobs_payload, "jobs", "runs", "items", "data")
-        states: dict[str, int] = {}
-        for job in jobs:
-            state = str(job.get("status", "unknown")) if isinstance(job, dict) else "unknown"
-            states[state] = states.get(state, 0) + 1
+        states = stats_payload.get("states", {}) if isinstance(stats_payload, dict) else {}
         return {"online": True, "base_url": BASE_URL, "account_count": len(accounts), "job_states": states}
     if name == "kcp_get_job":
         job_id = urllib.parse.quote(arguments["job_id"], safe="")
-        payload, _ = _request(f"/api/jobs/{job_id}")
+        query = urllib.parse.urlencode(
+            {"include_remote_logs": 0, "event_limit": 100}
+        )
+        payload, _ = _request(f"/api/jobs/{job_id}?{query}")
         return _safe(payload)
     if name == "kcp_submit_batch":
         jobs = [_source_job(job) for job in arguments["jobs"]]
