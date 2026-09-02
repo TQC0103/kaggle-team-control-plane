@@ -259,6 +259,18 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             return 200, service.job_events_page(
                 match.group(1), before_id=before_id, limit=limit
             )
+        match = re.fullmatch(r"/api/jobs/([^/]+)/logs", path)
+        if match and method == "GET":
+            raw_limit = self._query_one(query, "limit") or "200"
+            raw_before = self._query_one(query, "before_id")
+            try:
+                limit = int(raw_limit)
+                before_id = int(raw_before) if raw_before else None
+            except ValueError as exc:
+                raise ValidationError("log pagination values must be integers") from exc
+            return 200, service.job_remote_logs_page(
+                match.group(1), before_id=before_id, limit=limit
+            )
 
         if method == "GET" and path == "/api/audit":
             raw_limit = self._query_one(query, "limit") or "100"

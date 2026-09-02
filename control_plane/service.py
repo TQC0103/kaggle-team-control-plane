@@ -102,6 +102,12 @@ class ControlPlaneService:
             else:
                 raise ValidationError("adapter_name must be fake or kaggle")
         self.adapter = adapter
+        self._recovery_stop = threading.Event()
+        # Recovery keeps checking a remotely active kernel after a desktop
+        # restart.  Retain its last observed state in memory so a long Kaggle
+        # queue does not flood the event history with identical polls.
+        self._recovery_observations: dict[str, str] = {}
+        self._recovery_observations_lock = threading.Lock()
         recovered_job_ids = self.database.recover_interrupted_jobs()
         self.recovered_jobs = len(recovered_job_ids)
         self.scheduler = JobScheduler(
@@ -144,7 +150,24 @@ class ControlPlaneService:
             self._reconcile_recovered_jobs(recovered_job_ids)
 
     def close(self) -> None:
+        self._recovery_stop.set()
         self.scheduler.close()
+
+    def _schedule_recovered_job_recheck(self, job_id: str) -> None:
+        """Keep reconciling a remote run even if startup had no network.
+
+        A desktop close/reopen must not require a user to manually press a
+        retry button just to discover that Kaggle finished meanwhile.
+        """
+        def recheck() -> None:
+            if not self._recovery_stop.wait(30.0):
+                self._reconcile_recovered_jobs([job_id], announce_restart=False)
+
+        threading.Thread(
+            target=recheck,
+            name=f"kcp-recovery-recheck-{job_id[-8:]}",
+            daemon=True,
+        ).start()
 
     def health(self) -> dict[str, Any]:
         return {
@@ -155,7 +178,18 @@ class ControlPlaneService:
             "recovered_jobs_on_start": self.recovered_jobs,
         }
 
-    def _reconcile_recovered_jobs(self, job_ids: list[str]) -> None:
+    def _should_report_recovery_observation(
+        self, job_id: str, observation: str, *, announce_restart: bool
+    ) -> bool:
+        """Return whether this recovery observation merits a user-facing event."""
+        with self._recovery_observations_lock:
+            previous = self._recovery_observations.get(job_id)
+            self._recovery_observations[job_id] = observation
+        return announce_restart or previous != observation
+
+    def _reconcile_recovered_jobs(
+        self, job_ids: list[str], *, announce_restart: bool = True
+    ) -> None:
         """Refresh the true Kaggle state for jobs active when the app closed.
 
         This runs before the scheduler accepts new work, so an existing remote
@@ -179,13 +213,28 @@ class ControlPlaneService:
                 )
                 remote = self.adapter.status(job, env, threading.Event())
                 safe_detail = self.scheduler._redact(remote.detail, env)
-                self.database.append_job_event(
-                    job_id,
-                    f"Kaggle remote status after restart: {remote.state}",
-                    details={"detail": safe_detail},
-                    level="error" if remote.state == "failed" else "info",
-                )
-                active_states = {"submitting", "submitted", "running", "cancel_requested"}
+                if self._should_report_recovery_observation(
+                    job_id, remote.state, announce_restart=announce_restart
+                ):
+                    status_prefix = (
+                        "Kaggle remote status after restart"
+                        if announce_restart
+                        else "Kaggle remote status changed"
+                    )
+                    self.database.append_job_event(
+                        job_id,
+                        f"{status_prefix}: {remote.state}",
+                        details={"detail": safe_detail},
+                        level="error" if remote.state == "failed" else "info",
+                    )
+                # A locally cancelled/failed job can still have
+                # ``remote_may_be_running`` set.  Remote status is
+                # authoritative during recovery, so include those stale local
+                # terminal labels as valid transition sources as well.
+                active_states = {
+                    "submitting", "submitted", "running", "cancel_requested",
+                    "succeeded", "failed", "cancelled",
+                }
                 if remote.state == "running":
                     self.database.transition_job(
                         job_id,
@@ -193,6 +242,7 @@ class ControlPlaneService:
                         "running",
                         fields={"error": None, "remote_may_be_running": 1},
                     )
+                    self._schedule_recovered_job_recheck(job_id)
                 elif remote.state == "complete":
                     # Remote status is authoritative. Persist it before
                     # downloading artifacts: an output transfer can be slow,
@@ -234,6 +284,28 @@ class ControlPlaneService:
                             details={"error": self.scheduler._redact(str(exc), env)[:2000]},
                             level="warning",
                         )
+                    terminal_log_lines = 0
+                    try:
+                        terminal_log = self.adapter.terminal_logs(job, env, threading.Event())
+                        terminal_log_lines = self.scheduler._replace_remote_log_text(
+                            job_id, terminal_log, env
+                        )
+                        if terminal_log_lines:
+                            self.database.append_job_event(
+                                job_id,
+                                "Reconciled complete Kaggle log after restart",
+                                details={"line_count": terminal_log_lines},
+                            )
+                    except Exception as exc:
+                        self.database.append_job_event(
+                            job_id,
+                            "Could not reconcile complete Kaggle log after restart",
+                            details={"error": self.scheduler._redact(str(exc), env)[:2000]},
+                            level="warning",
+                        )
+                    self.scheduler._schedule_terminal_log_rechecks(
+                        job_id, job["kernel_slug"], env, terminal_log_lines
+                    )
                 elif remote.state == "failed":
                     self.database.transition_job(
                         job_id,
@@ -249,11 +321,15 @@ class ControlPlaneService:
                             },
                         },
                     )
+                    terminal_log_lines = 0
                     try:
                         failure_output = self.scheduler._redact(
                             self.adapter.diagnostics(job, env, threading.Event()), env
                         )
                         self.scheduler._redact_downloaded_text_files(failure_output, env)
+                        terminal_log_lines = self.scheduler._replace_remote_logs_from_download(
+                            job_id, failure_output, env
+                        )
                         self.database.transition_job(
                             job_id,
                             {"failed"},
@@ -266,6 +342,12 @@ class ControlPlaneService:
                                 }
                             },
                         )
+                        if terminal_log_lines:
+                            self.database.append_job_event(
+                                job_id,
+                                "Reconciled failed Kaggle log after restart",
+                                details={"line_count": terminal_log_lines},
+                            )
                     except Exception as exc:
                         self.database.append_job_event(
                             job_id,
@@ -273,6 +355,9 @@ class ControlPlaneService:
                             details={"error": self.scheduler._redact(str(exc), env)[:2000]},
                             level="warning",
                         )
+                    self.scheduler._schedule_terminal_log_rechecks(
+                        job_id, job["kernel_slug"], env, terminal_log_lines
+                    )
                 elif remote.state == "cancelled":
                     self.database.transition_job(
                         job_id,
@@ -296,6 +381,7 @@ class ControlPlaneService:
                         "submitted",
                         fields={"error": None, "remote_may_be_running": 1},
                     )
+                    self._schedule_recovered_job_recheck(job_id)
                 else:
                     self.database.append_job_event(
                         job_id,
@@ -303,13 +389,24 @@ class ControlPlaneService:
                         details={"remote_state": remote.state, "detail": safe_detail},
                         level="warning",
                     )
+                    self._schedule_recovered_job_recheck(job_id)
             except Exception as exc:
-                self.database.append_job_event(
-                    job_id,
-                    "Could not reconcile Kaggle state after restart; keeping job active",
-                    details={"error": self.scheduler._redact(str(exc), env)[:2000]},
-                    level="warning",
-                )
+                if self._should_report_recovery_observation(
+                    job_id, "error", announce_restart=announce_restart
+                ):
+                    message = (
+                        "Could not reconcile Kaggle state after restart; "
+                        "keeping job active and retrying automatically"
+                        if announce_restart
+                        else "Could not reconcile Kaggle state; keeping job active and retrying automatically"
+                    )
+                    self.database.append_job_event(
+                        job_id,
+                        message,
+                        details={"error": self.scheduler._redact(str(exc), env)[:2000]},
+                        level="warning",
+                    )
+                self._schedule_recovered_job_recheck(job_id)
 
     @staticmethod
     def _decorate_job(job: dict[str, Any]) -> dict[str, Any]:
@@ -762,7 +859,24 @@ class ControlPlaneService:
         ]
 
     def get_job(self, job_id: str) -> dict[str, Any]:
-        return self._decorate_job(self.database.get_job(job_id))
+        return self._decorate_job(self.database.get_job(job_id, include_remote_logs=True))
+
+    def job_remote_logs_page(
+        self, job_id: str, *, before_id: int | None = None, limit: int = 200
+    ) -> dict[str, Any]:
+        self.database.get_job(job_id)
+        bounded_limit = max(1, min(limit, 500))
+        lines = self.database.list_remote_log_lines(
+            job_id, limit=bounded_limit + 1, before_id=before_id
+        )
+        has_more = len(lines) > bounded_limit
+        if has_more:
+            lines = lines[1:]
+        return {
+            "logs": lines,
+            "before_id": lines[0]["sequence_id"] if lines else None,
+            "has_more": has_more,
+        }
 
     def remote_job_status(self, job_id: str) -> dict[str, Any]:
         """Read the remote Kaggle state for an interrupted local monitor.
@@ -800,6 +914,15 @@ class ControlPlaneService:
                 "files": files,
                 "log_tail": self.scheduler._redact(log_tail, env),
             }
+            self.database.transition_job(
+                job_id,
+                {"submitted", "running", "cancel_requested"},
+                "failed",
+                fields={
+                    "error": result["detail"] or "Kaggle reported failure",
+                    "remote_may_be_running": 0,
+                },
+            )
         elif remote.state == "complete":
             output = self.adapter.output(job, env, threading.Event())
             safe_output = self.scheduler._redact(output, env)
@@ -824,7 +947,11 @@ class ControlPlaneService:
                     job_id,
                     {"submitted", "running"},
                     "succeeded",
-                    fields={"result": completed_result, "error": None},
+                    fields={
+                        "result": completed_result,
+                        "error": None,
+                        "remote_may_be_running": 0,
+                    },
                 )
                 if changed:
                     self.database.append_job_event(
@@ -835,11 +962,32 @@ class ControlPlaneService:
                             "file_count": len(safe_output.get("files", [])),
                         },
                     )
+            else:
+                # The remote result is terminal even if the local job had
+                # already been marked uncertain by a transient CLI outage.
+                self.database.transition_job(
+                    job_id,
+                    {"cancel_requested"},
+                    "succeeded",
+                    fields={
+                        "result": {
+                            "remote_status": result["detail"],
+                            "output": safe_output,
+                        },
+                        "error": None,
+                        "remote_may_be_running": 0,
+                    },
+                )
         return result
 
     def cancel_job(self, job_id: str, actor: str) -> dict[str, Any]:
         job, semantics = self.database.request_cancel(job_id, actor)
         self.scheduler.request_cancel(job_id)
+        if semantics == "local_monitor_stop_requested":
+            # Kaggle's public CLI cannot stop a submitted kernel by slug.  Do
+            # not make the operator clear a guard by hand: keep checking the
+            # remote job until Kaggle itself reports a terminal state.
+            self._schedule_recovered_job_recheck(job_id)
         return {"job": self._decorate_job(job), "cancel_semantics": semantics}
 
     def retry_job(self, job_id: str, actor: str) -> dict[str, Any]:
@@ -899,6 +1047,18 @@ class ControlPlaneService:
                     f"[{str(event.get('level', 'info')).upper()}] "
                     f"{event.get('message', '')}{detail_text}\n"
                 )
+            live_log_bytes = 20 * 1024 * 1024
+            live_logs = self.database.list_remote_log_lines(job["id"], limit=50000)
+            if live_logs:
+                output.write("\n=== Kaggle live output (captured verbatim) ===\n")
+                for entry in live_logs:
+                    line = str(entry.get("line", ""))
+                    encoded = (line + "\n").encode("utf-8", errors="replace")
+                    if len(encoded) > live_log_bytes:
+                        output.write("[live output download truncated at 20 MiB]\n")
+                        break
+                    output.write(line + "\n")
+                    live_log_bytes -= len(encoded)
             remaining_bytes = 5 * 1024 * 1024
             output_dir = Path(job["output_dir"]).resolve()
             for remote_log in remote_logs[:20]:

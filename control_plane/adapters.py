@@ -108,6 +108,10 @@ class KaggleAdapter(Protocol):
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> str: ...
 
+    def terminal_logs(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> str: ...
+
     def diagnostics(
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> dict[str, Any]: ...
@@ -442,6 +446,42 @@ class KaggleCliAdapter:
             )
         return output
 
+    @staticmethod
+    def _kernel_log_text(output: str) -> str:
+        """Convert Kaggle's JSON log envelope into the web-visible text.
+
+        Current Kaggle CLI returns a JSON array of stream records even without
+        a JSON flag.  Its ``data`` fields are exactly what the notebook log UI
+        renders.  A bounded ``--follow`` capture can end mid-array, so decode
+        complete objects one at a time rather than requiring valid whole JSON.
+        Plain-text output remains untouched for older CLI versions.
+        """
+        if not output.strip():
+            return ""
+        decoder = json.JSONDecoder()
+        position = 0
+        length = len(output)
+        while position < length and output[position].isspace():
+            position += 1
+        if position >= length or output[position] != "[":
+            return output
+        position += 1
+        records: list[str] = []
+        while position < length:
+            while position < length and (output[position].isspace() or output[position] == ","):
+                position += 1
+            if position >= length or output[position] == "]":
+                break
+            try:
+                record, position = decoder.raw_decode(output, position)
+            except json.JSONDecodeError:
+                # The local follower was intentionally stopped during this
+                # record; retain parsed records and wait for the next snapshot.
+                break
+            if isinstance(record, dict) and isinstance(record.get("data"), str):
+                records.append(record["data"])
+        return "".join(records) if records else output
+
     def submit(
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> dict[str, Any]:
@@ -525,18 +565,28 @@ class KaggleCliAdapter:
     def logs(
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> str:
-        return self._run_follow_snapshot(
+        raw = self._run_follow_snapshot(
             ["kernels", "logs", "--follow", job["kernel_slug"]], env, cancel_event
         )
+        return self._kernel_log_text(raw)
+
+    def terminal_logs(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> str:
+        """Read Kaggle's immutable log after a kernel reaches a terminal state."""
+        return self._kernel_log_text(self._run(
+            ["kernels", "logs", job["kernel_slug"]],
+            env,
+            cancel_event,
+            timeout_seconds=30,
+        ))
 
     def diagnostics(
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> dict[str, Any]:
         output_dir = Path(job["output_dir"]).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
-        message = self._run(
-            ["kernels", "logs", job["kernel_slug"]], env, cancel_event
-        )
+        message = self.terminal_logs(job, env, cancel_event)
         if not message:
             raise AdapterError("Kaggle returned an empty kernel diagnostic log")
         target = output_dir / f"{job['kernel_slug'].split('/', 1)[-1]}.log"
@@ -716,6 +766,13 @@ class FakeKaggleAdapter:
             self._log_polls[job["id"]] = count
         return "\n".join(str(line) for line in configured[:count])
 
+    def terminal_logs(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> str:
+        if cancel_event.is_set():
+            raise LocalCommandCancelled("fake terminal-log read cancelled")
+        return str(job["metadata"].get("fake_terminal_log", ""))
+
     def diagnostics(
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> dict[str, Any]:
@@ -724,12 +781,11 @@ class FakeKaggleAdapter:
         output_dir = Path(job["output_dir"]).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
         log_path = output_dir / f"{job['kernel_slug'].split('/', 1)[-1]}.log"
+        message = self.terminal_logs(job, env, cancel_event) or str(
+            job["metadata"].get("fake_remote_log", "Traceback: fake remote kernel failure")
+        )
         log_path.write_text(
-            str(
-                job["metadata"].get(
-                    "fake_remote_log", "Traceback: fake remote kernel failure"
-                )
-            ),
+            message,
             encoding="utf-8",
         )
         return {

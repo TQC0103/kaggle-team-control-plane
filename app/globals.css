@@ -831,6 +831,7 @@ a:focus-visible {
 .safety-action-section label { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
 .safety-action-section label > span, .safety-kicker { color: #9c3d2f; font: 700 8px var(--font-geist-mono), monospace; letter-spacing: .05em; }
 .safety-action-section input { width: 100%; height: 39px; padding: 0 10px; border: 1px solid #dfa69d; background: white; }
+.safety-reconcile-button { grid-column: 1 / -1; justify-self: start; }
 .safety-quota { border-color: #e5c27a; background: #fff8e8; }
 .safety-quota label > span, .safety-quota .safety-kicker { color: #85600e; }
 .safety-quota input { border-color: #dfc078; }
@@ -870,7 +871,11 @@ a:focus-visible {
 .log-panel header > div { display: flex; align-items: center; gap: 10px; }
 .log-panel header button { border: 1px solid #4b4d42; background: transparent; color: var(--lime); padding: 4px 7px; font: 700 8px var(--font-geist-mono), monospace; cursor: pointer; }
 .log-panel header button:disabled { color: #6c6e65; cursor: not-allowed; }
-.log-panel pre { min-height: 210px; max-height: 310px; margin: 0; padding: 15px; overflow: auto; white-space: pre-wrap; font: 8px/1.8 var(--font-geist-mono), monospace; }
+.log-panel pre { min-height: 210px; max-height: 460px; margin: 0; padding: 15px; overflow-x: auto; overflow-y: scroll; scrollbar-gutter: stable; overscroll-behavior: contain; white-space: pre-wrap; font: 8px/1.8 var(--font-geist-mono), monospace; }
+.log-panel pre::-webkit-scrollbar { width: 13px; height: 13px; }
+.log-panel pre::-webkit-scrollbar-track { background: #171813; }
+.log-panel pre::-webkit-scrollbar-thumb { min-height: 36px; border: 3px solid #171813; border-radius: 9px; background: #74776b; }
+.log-panel pre::-webkit-scrollbar-thumb:hover { background: #a9ad9e; }
 .log-panel pre code { display: block; }
 .log-panel pre span { display: inline-block; width: 26px; color: #5f6158; user-select: none; }
 .load-more-logs { width: 100%; padding: 10px; border: 0; border-top: 1px solid #3b3c34; background: #23241f; color: var(--lime); font: 700 8px var(--font-geist-mono), monospace; cursor: pointer; }

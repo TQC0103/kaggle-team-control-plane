@@ -220,14 +220,13 @@ are downloaded only under the managed artifact root. See
 - After submission starts, Kaggle CLI has no reliable public remote-stop
   operation. Cancel/revoke stops the local CLI or monitor, but the remote kernel
   may continue.
-- Such a terminal job has `remote_may_be_running=true`; its account exposes
-  `remote_reconciliation_required=true`. New batches, retries, and dispatch are
-  blocked for that account.
-- Check that owner's kernel directly on Kaggle. Only after confirming it is no
-  longer active, open **Manage account**, type the Kaggle username, and choose
-  **Confirm reconciliation**. This clears the local uncertainty flag, writes an
-  audit event, and wakes the queue. Never reconcile while the remote run may
-  still be active.
+- Such a job has `remote_may_be_running=true`; its account pauses new batches,
+  retries, and dispatch while the remote state is checked.
+- Control Plane rechecks Kaggle automatically, including after desktop restart
+  and after a local-only cancellation. The dashboard distinguishes a confirmed
+  active remote kernel from a terminal local record awaiting confirmation; it
+  never asks an operator to type a username to "unlock" either state. Scheduling
+  resumes only after Kaggle reports a terminal result.
 
 ### Official Kaggle quota
 

@@ -148,6 +148,84 @@ class JobScheduler:
     def request_quota_sync(self) -> None:
         self._quota_wake.set()
 
+    @staticmethod
+    def _repair_utf8_mojibake(text: str) -> str:
+        """Repair a Windows console's common UTF-8-as-Latin-1 log decoding.
+
+        Kaggle's follow stream is UTF-8.  On some Windows CLI launches the
+        box-drawing bytes used by pip/tqdm arrive as Latin-1 code points
+        (``â–ˆ``).  That changed otherwise identical snapshots enough to defeat
+        incremental matching and duplicate the full log at completion.  Only
+        accept the conversion when it is a valid UTF-8 round trip, so normal
+        non-ASCII text is left untouched.
+        """
+        for legacy_codec in ("cp1252", "latin-1"):
+            try:
+                return text.encode(legacy_codec).decode("utf-8")
+            except UnicodeError:
+                continue
+        return text
+
+    @staticmethod
+    def _incremental_remote_log_text(previous: str, current: str) -> tuple[str, bool]:
+        """Return unseen characters across append-only or replayed snapshots.
+
+        Character overlap, instead of per-line overlap, also handles a
+        snapshot stopped mid-progress-line.  A later full replay then extends
+        that partial line instead of being classified as a fresh log.
+        """
+        if current == previous:
+            return "", False
+        if not previous:
+            return current, False
+        if current.startswith(previous):
+            return current[len(previous) :], False
+
+        # A bounded follower may reconnect at a tail, while the terminal
+        # status fetch replays from line zero.  Prefer the last occurrence so
+        # only text after the most recent prior snapshot is stored.
+        replay_start = current.rfind(previous)
+        if replay_start >= 0:
+            return current[replay_start + len(previous) :], False
+
+        maximum = min(len(previous), len(current))
+        for size in range(maximum, 0, -1):
+            if previous[-size:] == current[:size]:
+                return current[size:], False
+        return current, True
+
+    @staticmethod
+    def _incremental_remote_log_lines(
+        previous: list[str], current: list[str]
+    ) -> tuple[list[str], bool]:
+        """Return only unseen lines across Kaggle SSE reconnects.
+
+        A live ``--follow`` snapshot can be a tail, while a terminal log read
+        often begins from line zero.  Matching only a previous suffix against
+        the new prefix duplicated the entire run at that boundary.  First look
+        for a trailing anchor anywhere in the new snapshot, then fall back to
+        the tail-to-prefix case used by two partial streams.
+        """
+        if current == previous:
+            return [], False
+        if current[: len(previous)] == previous:
+            return current[len(previous) :], False
+        if not previous:
+            return current, False
+
+        anchor_size = min(len(previous), 64)
+        while anchor_size:
+            anchor = previous[-anchor_size:]
+            for start in range(len(current) - anchor_size, -1, -1):
+                if current[start : start + anchor_size] == anchor:
+                    return current[start + anchor_size :], False
+            anchor_size -= 1
+
+        for size in range(min(len(previous), len(current)), 0, -1):
+            if previous[-size:] == current[:size]:
+                return current[size:], False
+        return current, True
+
     def sync_account_quota(self, account_id: str) -> dict[str, Any] | None:
         account = self.database.get_account(account_id)
         credential_ref = account.get("credential_env_ref")
@@ -339,36 +417,37 @@ class JobScheduler:
 
             seen_running = False
             last_remote_state: str | None = None
-            remote_log_snapshot: list[str] = []
+            remote_log_snapshot = ""
             next_live_log_poll = 0.0
             live_log_error_reported = False
+            status_error_reported = False
 
             def sync_live_output() -> None:
                 nonlocal remote_log_snapshot, live_log_error_reported
                 try:
                     raw_log = self.adapter.logs(staged_job, env, cancel_event)
-                    safe_log = self._redact(raw_log, env)
-                    current_lines = [line[:2000] for line in safe_log.splitlines()]
-                    if len(current_lines) > 5000:
-                        current_lines = current_lines[-5000:]
-                    if current_lines[: len(remote_log_snapshot)] == remote_log_snapshot:
-                        new_lines = current_lines[len(remote_log_snapshot) :]
-                        reset = False
-                    elif current_lines == remote_log_snapshot:
-                        new_lines = []
-                        reset = False
-                    else:
-                        new_lines = current_lines[-200:]
-                        reset = bool(remote_log_snapshot)
-                    remote_log_snapshot = current_lines
+                    # The generic redactor limits event/details strings to
+                    # keep the database small. A Kaggle transcript is a
+                    # separate bounded store (50,000 lines), so never apply
+                    # that 8k-character event-preview limit here.
+                    safe_log = self._repair_utf8_mojibake(
+                        self._redact(raw_log, env, max_text_chars=None)
+                    )
+                    current_lines = safe_log.splitlines()
+                    if len(current_lines) > 10000:
+                        safe_log = "\n".join(current_lines[-10000:])
+                    new_log, reset = self._incremental_remote_log_text(
+                        remote_log_snapshot, safe_log
+                    )
+                    remote_log_snapshot = safe_log
+                    new_lines = [line for line in new_log.splitlines() if line]
                     if new_lines:
-                        dropped = max(0, len(new_lines) - 200)
+                        self.database.append_remote_log_lines(job_id, new_lines)
                         self.database.append_job_event(
                             job_id,
                             "Synced live Kaggle output",
                             details={
-                                "lines": new_lines[-200:],
-                                "dropped_lines": dropped,
+                                "line_count": len(new_lines),
                                 "remote_log_reset": reset,
                             },
                         )
@@ -386,7 +465,43 @@ class JobScheduler:
                         live_log_error_reported = True
 
             while not cancel_event.is_set():
-                remote = self.adapter.status(staged_job, env, cancel_event)
+                try:
+                    remote = self.adapter.status(staged_job, env, cancel_event)
+                except LocalCommandCancelled:
+                    raise
+                except Exception as exc:
+                    # A DNS, CLI or local connectivity failure says nothing
+                    # about a kernel that has already been accepted by Kaggle.
+                    # Keep it active and keep trying rather than fabricating a
+                    # terminal ``failed`` state.
+                    if not status_error_reported:
+                        self.database.append_job_event(
+                            job_id,
+                            "Could not query Kaggle status; keeping remote job active",
+                            details={"error": self._redact(str(exc), env)[:2000]},
+                            level="warning",
+                        )
+                        status_error_reported = True
+                    current = self.database.get_job(job_id)
+                    active_state = (
+                        current["status"]
+                        if current["status"] in {"submitted", "running"}
+                        else "submitted"
+                    )
+                    self.database.transition_job(
+                        job_id,
+                        ACTIVE_JOB_STATES,
+                        active_state,
+                        fields={
+                            "error": "Kaggle status is temporarily unavailable; remote execution may still be running",
+                            "remote_may_be_running": 1,
+                            "result": {"submit": submit_result} if submit_result else None,
+                        },
+                    )
+                    if cancel_event.wait(self.remote_poll_seconds):
+                        break
+                    continue
+                status_error_reported = False
                 safe_detail = self._redact(remote.detail, env)
                 if remote.state != last_remote_state:
                     self.database.append_job_event(
@@ -403,45 +518,89 @@ class JobScheduler:
                     next_live_log_poll = time.monotonic() + self.live_log_poll_seconds
                     sync_live_output()
                 if remote.state == "complete":
-                    output_result = self._redact(
-                        self.adapter.output(staged_job, env, cancel_event), env
-                    )
-                    self.database.append_job_event(
-                        job_id,
-                        "Downloaded job output",
-                        details={
-                            "output_dir": output_result.get("output_dir"),
-                            "file_count": len(output_result.get("files", [])),
-                        },
+                    output_result = None
+                    terminal_log_lines = 0
+                    try:
+                        output_result = self._redact(
+                            self.adapter.output(staged_job, env, cancel_event), env
+                        )
+                        self.database.append_job_event(
+                            job_id,
+                            "Downloaded job output",
+                            details={
+                                "output_dir": output_result.get("output_dir"),
+                                "file_count": len(output_result.get("files", [])),
+                            },
+                        )
+                    except LocalCommandCancelled:
+                        raise
+                    except Exception as exc:
+                        self.database.append_job_event(
+                            job_id,
+                            "Kaggle completed but output download will be retried on demand",
+                            details={"error": self._redact(str(exc), env)[:2000]},
+                            level="warning",
+                        )
+                    try:
+                        terminal_log = self.adapter.terminal_logs(
+                            staged_job, env, cancel_event
+                        )
+                        terminal_log_lines = self._replace_remote_log_text(
+                            job_id, terminal_log, env
+                        )
+                        if terminal_log_lines:
+                            self.database.append_job_event(
+                                job_id,
+                                "Reconciled complete Kaggle log",
+                                details={"line_count": terminal_log_lines},
+                            )
+                    except LocalCommandCancelled:
+                        raise
+                    except Exception as exc:
+                        self.database.append_job_event(
+                            job_id,
+                            "Could not reconcile complete Kaggle log",
+                            details={"error": self._redact(str(exc), env)[:2000]},
+                            level="warning",
+                        )
+                    self._schedule_terminal_log_rechecks(
+                        job_id, staged_job["kernel_slug"], env, terminal_log_lines
                     )
                     result = {
                         "submit": submit_result,
                         "remote_status": safe_detail,
-                        "output": output_result,
+                        "output_pending": output_result is None,
                     }
+                    if output_result is not None:
+                        result["output"] = output_result
                     changed = self.database.transition_job(
                         job_id,
                         {"submitted", "running"},
                         "succeeded",
-                        fields={"result": result, "error": None},
+                        fields={"result": result, "error": None, "remote_may_be_running": 0},
                     )
                     if not changed and self.database.get_job(job_id)["status"] == "cancel_requested":
                         raise LocalCommandCancelled("local monitor stop requested")
                     return
                 if remote.state == "failed":
                     failure_output = None
+                    terminal_log_lines = 0
                     try:
                         raw_failure_output = self.adapter.diagnostics(
                             staged_job, env, cancel_event
                         )
                         self._redact_downloaded_text_files(raw_failure_output, env)
                         failure_output = self._redact(raw_failure_output, env)
+                        terminal_log_lines = self._replace_remote_logs_from_download(
+                            job_id, raw_failure_output, env
+                        )
                         self.database.append_job_event(
                             job_id,
-                            "Downloaded failed Kaggle kernel diagnostics",
+                            "Downloaded and reconciled failed Kaggle kernel diagnostics",
                             details={
                                 "output_dir": failure_output.get("output_dir"),
                                 "file_count": len(failure_output.get("files", [])),
+                                "line_count": terminal_log_lines,
                             },
                         )
                     except LocalCommandCancelled:
@@ -453,6 +612,9 @@ class JobScheduler:
                             details={"error": self._redact(str(exc), env)},
                             level="warning",
                         )
+                    self._schedule_terminal_log_rechecks(
+                        job_id, staged_job["kernel_slug"], env, terminal_log_lines
+                    )
                     result = {"submit": submit_result}
                     if failure_output is not None:
                         result["failure_output"] = failure_output
@@ -463,6 +625,7 @@ class JobScheduler:
                         fields={
                             "error": safe_detail or "Kaggle reported failure",
                             "result": result,
+                            "remote_may_be_running": 0,
                         },
                     )
                     if not changed and self.database.get_job(job_id)["status"] == "cancel_requested":
@@ -476,6 +639,7 @@ class JobScheduler:
                         fields={
                             "error": safe_detail or "Kaggle reported cancellation",
                             "result": {"submit": submit_result},
+                            "remote_may_be_running": 0,
                         },
                     )
                     if not changed and self.database.get_job(job_id)["status"] == "cancel_requested":
@@ -495,6 +659,34 @@ class JobScheduler:
                 job_id, safe_error, level="warning"
             )
             current = self.database.get_job(job_id)
+            if self._stop.is_set() and not current["cancel_requested"]:
+                # Closing the desktop app stops only this local monitor.  It
+                # must never be recorded as a user cancellation: Kaggle can
+                # keep the remote kernel alive after Windows shuts down or
+                # the window closes.  Preserve an active state so startup
+                # reconciliation restores the actual remote status.
+                active_state = (
+                    current["status"]
+                    if current["status"] in {"submitted", "running"}
+                    else "submitted"
+                )
+                self.database.transition_job(
+                    job_id,
+                    ACTIVE_JOB_STATES,
+                    active_state,
+                    fields={
+                        "error": "control plane stopped local monitoring; reconciling remote Kaggle status on restart",
+                        "remote_may_be_running": 1,
+                        "cancel_requested": 0,
+                        "result": {"submit": submit_result} if submit_result else None,
+                    },
+                )
+                self.database.append_job_event(
+                    job_id,
+                    "Local monitor stopped for app shutdown; remote Kaggle run was preserved",
+                    level="warning",
+                )
+                return
             remote_uncertain = bool(
                 current.get("remote_may_be_running") or submit_started
             )
@@ -556,6 +748,89 @@ class JobScheduler:
                     },
                 )
 
+    def _terminal_log_lines(self, raw_text: str, env: dict[str, str] | None) -> list[str]:
+        # Terminal transcripts use the same bounded remote-log store as live
+        # snapshots; preserve every captured line after credential redaction.
+        safe_text = self._repair_utf8_mojibake(
+            self._redact(raw_text, env, max_text_chars=None)
+        )
+        return [line for line in safe_text.splitlines() if line]
+
+    def _replace_remote_log_text(
+        self, job_id: str, raw_text: str, env: dict[str, str] | None
+    ) -> int:
+        """Replace bounded live snapshots with Kaggle's terminal transcript."""
+        lines = self._terminal_log_lines(raw_text, env)
+        return self.database.replace_remote_log_lines(job_id, lines) if lines else 0
+
+    def _schedule_terminal_log_rechecks(
+        self,
+        job_id: str,
+        kernel_slug: str,
+        env: dict[str, str],
+        initial_line_count: int,
+    ) -> None:
+        """Let Kaggle finish publishing its terminal notebook log.
+
+        ``KernelWorkerStatus.ERROR``/``COMPLETE`` can arrive before Kaggle has
+        appended conversion messages and the final traceback.  Re-read only
+        the immutable terminal log a few times; update it only when it grew,
+        so a stale or truncated fetch never replaces a more complete view.
+        """
+        def refresh() -> None:
+            line_count = initial_line_count
+            terminal_job = {"kernel_slug": kernel_slug}
+            for delay in (5.0, 15.0, 30.0):
+                if self._stop.wait(delay):
+                    return
+                try:
+                    lines = self._terminal_log_lines(
+                        self.adapter.terminal_logs(terminal_job, env, threading.Event()), env
+                    )
+                    if len(lines) <= line_count:
+                        continue
+                    line_count = self.database.replace_remote_log_lines(job_id, lines)
+                    self.database.append_job_event(
+                        job_id,
+                        "Refreshed terminal Kaggle log",
+                        details={"line_count": line_count},
+                    )
+                except Exception as exc:
+                    self.database.append_job_event(
+                        job_id,
+                        "Could not refresh terminal Kaggle log",
+                        details={"error": self._redact(str(exc), env)[:2000]},
+                        level="warning",
+                    )
+                    return
+
+        threading.Thread(
+            target=refresh,
+            name=f"kcp-terminal-log-refresh-{job_id[-8:]}",
+            daemon=True,
+        ).start()
+
+    def _replace_remote_logs_from_download(
+        self, job_id: str, output_result: dict[str, Any], env: dict[str, str] | None
+    ) -> int:
+        output_dir_value = output_result.get("output_dir")
+        files = output_result.get("files")
+        if not isinstance(output_dir_value, str) or not isinstance(files, list):
+            return 0
+        output_dir = Path(output_dir_value).resolve()
+        for relative in files:
+            if not isinstance(relative, str) or not relative.lower().endswith(".log"):
+                continue
+            path = (output_dir / relative).resolve()
+            if not path.is_relative_to(output_dir) or not path.is_file():
+                continue
+            if path.stat().st_size > 64 * 1024 * 1024:
+                continue
+            return self._replace_remote_log_text(
+                job_id, path.read_text(encoding="utf-8", errors="replace"), env
+            )
+        return 0
+
     @staticmethod
     def _redact_downloaded_text_files(
         output_result: dict[str, Any], env: dict[str, str] | None
@@ -592,7 +867,12 @@ class JobScheduler:
             temporary.replace(path)
 
     @staticmethod
-    def _redact(value: Any, env: dict[str, str] | None) -> Any:
+    def _redact(
+        value: Any,
+        env: dict[str, str] | None,
+        *,
+        max_text_chars: int | None = 8000,
+    ) -> Any:
         secrets = []
         if env:
             secrets = [
@@ -604,14 +884,22 @@ class JobScheduler:
             result = value
             for secret in secrets:
                 result = result.replace(secret, "[REDACTED]")
-            return result[:8000]
+            return result if max_text_chars is None else result[:max_text_chars]
         if isinstance(value, dict):
             return {
-                str(key)[:200]: JobScheduler._redact(item, env)
+                str(key)[:200]: JobScheduler._redact(
+                    item, env, max_text_chars=max_text_chars
+                )
                 for key, item in list(value.items())[:1000]
             }
         if isinstance(value, list):
-            return [JobScheduler._redact(item, env) for item in value[:1000]]
+            return [
+                JobScheduler._redact(item, env, max_text_chars=max_text_chars)
+                for item in value[:1000]
+            ]
         if isinstance(value, tuple):
-            return [JobScheduler._redact(item, env) for item in value[:1000]]
+            return [
+                JobScheduler._redact(item, env, max_text_chars=max_text_chars)
+                for item in value[:1000]
+            ]
         return value

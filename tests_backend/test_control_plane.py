@@ -19,6 +19,7 @@ from control_plane.adapters import (
     AdapterError,
     FakeKaggleAdapter,
     KaggleCliAdapter,
+    RemoteStatus,
     hidden_subprocess_kwargs,
     read_runtime_manifest,
 )
@@ -26,6 +27,7 @@ from control_plane.api import create_server
 from control_plane.credentials import EnvCredentialVault
 from control_plane.errors import ConflictError, ValidationError
 from control_plane.service import ControlPlaneService
+from control_plane.scheduler import JobScheduler
 
 
 def make_source(root: Path, name: str, original_id: str = "old-owner/old-kernel") -> Path:
@@ -167,7 +169,7 @@ class KaggleCliAdapterTests(unittest.TestCase):
             adapter = KaggleCliAdapter()
             calls = []
 
-            def fake_run(args, *_rest):
+            def fake_run(args, *_rest, **_kwargs):
                 calls.append(args)
                 return "Traceback: remote failure"
 
@@ -209,6 +211,15 @@ class KaggleCliAdapterTests(unittest.TestCase):
             calls,
             [["kernels", "logs", "--follow", "expected-owner/expected-slug"]],
         )
+
+    def test_kaggle_json_log_envelope_is_rendered_as_web_visible_text(self) -> None:
+        payload = json.dumps([
+            {"stream_name": "stdout", "time": 1.0, "data": "epoch 1\\n"},
+            {"stream_name": "stderr", "time": 2.0, "data": "warning\\n"},
+        ])
+        self.assertEqual(KaggleCliAdapter._kernel_log_text(payload), "epoch 1\\nwarning\\n")
+        partial = payload[:-2]
+        self.assertEqual(KaggleCliAdapter._kernel_log_text(partial), "epoch 1\\n")
 
     def test_live_log_snapshot_captures_unbuffered_partial_output(self) -> None:
         adapter = KaggleCliAdapter(
@@ -416,6 +427,202 @@ class StorageAndCredentialsTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_reaffirming_submitted_does_not_reset_remote_runtime_clock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = ControlPlaneService(
+                root / "state.sqlite3",
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=FakeKaggleAdapter(),
+                vault=EnvCredentialVault({"CLOCK_ACCOUNT": "token"}),
+                start_scheduler=False,
+            )
+            try:
+                account = service.create_account(
+                    account_payload("clock-user", "CLOCK_ACCOUNT"), "tester"
+                )
+                batch = service.create_batch(
+                    {
+                        "name": "runtime clock",
+                        "jobs": [{
+                            "account_id": account["id"],
+                            "experiment_name": "runtime clock",
+                            "source_dir": str(make_source(root, "clock-source")),
+                            "kernel_slug": "runtime-clock",
+                        }],
+                    },
+                    "tester",
+                )
+                job_id = batch["jobs"][0]["id"]
+                self.assertTrue(service.database.transition_job(job_id, {"queued"}, "submitting"))
+                original_remote_started_at = "2026-08-25T00:00:00+00:00"
+                self.assertTrue(service.database.transition_job(
+                    job_id,
+                    {"submitting"},
+                    "submitted",
+                    fields={"remote_started_at": original_remote_started_at},
+                ))
+                self.assertTrue(service.database.transition_job(
+                    job_id, {"submitted"}, "submitted", fields={"remote_may_be_running": 1}
+                ))
+                self.assertEqual(
+                    service.get_job(job_id)["remote_started_at"], original_remote_started_at
+                )
+                self.assertEqual(
+                    sum(
+                        event["message"] == "Job status changed to submitted"
+                        for event in service.get_job(job_id)["events"]
+                    ),
+                    1,
+                )
+            finally:
+                service.close()
+
+    def test_live_log_reconnect_deduplicates_a_full_terminal_replay(self) -> None:
+        previous = ["one", "two", "three"]
+        current = ["zero", "one", "two", "three", "four"]
+        lines, reset = JobScheduler._incremental_remote_log_lines(previous, current)
+        self.assertEqual(lines, ["four"])
+        self.assertFalse(reset)
+
+    def test_live_log_text_deduplicates_a_replay_after_partial_progress_output(self) -> None:
+        previous = "starting\nprogress 50%|████"
+        current = "starting\nprogress 50%|██████\ncomplete\n"
+        new_text, reset = JobScheduler._incremental_remote_log_text(previous, current)
+        self.assertEqual(new_text, "██\ncomplete\n")
+        self.assertFalse(reset)
+
+    def test_live_log_mojibake_is_normalized_before_snapshot_matching(self) -> None:
+        mojibake = "progress â–ˆâ–ˆâ–ˆ"
+        self.assertEqual(JobScheduler._repair_utf8_mojibake(mojibake), "progress ███")
+        previous = "progress ███"
+        new_text, reset = JobScheduler._incremental_remote_log_text(
+            previous, JobScheduler._repair_utf8_mojibake(mojibake) + "\ndone"
+        )
+        self.assertEqual(new_text, "\ndone")
+        self.assertFalse(reset)
+
+    def test_log_redaction_preserves_full_transcript_while_hiding_credentials(self) -> None:
+        transcript = "first\n" + ("step\n" * 3000) + "secret-token\nlast\n"
+        safe = JobScheduler._redact(
+            transcript,
+            {"KAGGLE_API_TOKEN": "secret-token"},
+            max_text_chars=None,
+        )
+        self.assertNotIn("secret-token", safe)
+        self.assertIn("[REDACTED]", safe)
+        self.assertTrue(safe.endswith("last\n"))
+        self.assertGreater(len(safe), 8000)
+
+    def test_transient_status_error_after_submit_does_not_fabricate_failure(self) -> None:
+        class FlakyStatusAdapter(FakeKaggleAdapter):
+            def __init__(self) -> None:
+                super().__init__(poll_delay_seconds=0.005)
+                self.status_calls = 0
+
+            def status(self, job, env, cancel_event):  # type: ignore[no-untyped-def]
+                self.status_calls += 1
+                if self.status_calls == 2:
+                    raise AdapterError("temporary DNS lookup failure")
+                return super().status(job, env, cancel_event)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            adapter = FlakyStatusAdapter()
+            service = ControlPlaneService(
+                root / "state.sqlite3",
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=adapter,
+                vault=EnvCredentialVault({"FLAKY_ACCOUNT": "token"}),
+                remote_poll_seconds=0.005,
+                dispatch_poll_seconds=0.005,
+            )
+            try:
+                account = service.create_account(
+                    account_payload("flaky-user", "FLAKY_ACCOUNT"), "tester"
+                )
+                batch = service.create_batch(
+                    {
+                        "name": "temporary status outage",
+                        "jobs": [{
+                            "account_id": account["id"],
+                            "experiment_name": "survives local DNS outage",
+                            "source_dir": str(make_source(root, "flaky-source")),
+                            "kernel_slug": "flaky-status",
+                            "metadata": {"fake_polls": 4},
+                        }],
+                    },
+                    "tester",
+                )
+                job_id = batch["jobs"][0]["id"]
+                completed = wait_for_status(service, job_id, {"succeeded"})
+                self.assertFalse(completed["remote_may_be_running"])
+                self.assertTrue(any(
+                    event["message"] == "Could not query Kaggle status; keeping remote job active"
+                    for event in completed["events"]
+                ))
+                self.assertFalse(any(
+                    event["message"] == "Job status changed to failed"
+                    for event in completed["events"]
+                ))
+            finally:
+                service.close()
+
+    def test_remote_log_lines_survive_large_snapshot_and_paginate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = ControlPlaneService(
+                root / "state.sqlite3",
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=FakeKaggleAdapter(),
+                vault=EnvCredentialVault({"LOG_ACCOUNT": "token"}),
+                start_scheduler=False,
+            )
+            try:
+                account = service.create_account(
+                    account_payload("log-user", "LOG_ACCOUNT"), "tester"
+                )
+                batch = service.create_batch(
+                    {
+                        "name": "remote log storage",
+                        "jobs": [{
+                            "account_id": account["id"],
+                            "experiment_name": "log storage",
+                            "source_dir": str(make_source(root, "log-source")),
+                            "kernel_slug": "log-storage",
+                        }],
+                    },
+                    "tester",
+                )
+                job_id = batch["jobs"][0]["id"]
+                expected = [f"Kaggle line {index}" for index in range(600)]
+                self.assertEqual(service.database.append_remote_log_lines(job_id, expected), 600)
+                newest = service.job_remote_logs_page(job_id, limit=200)
+                self.assertEqual([row["line"] for row in newest["logs"]], expected[-200:])
+                self.assertTrue(newest["has_more"])
+                detail = service.get_job(job_id)
+                self.assertEqual(
+                    [row["line"] for row in detail["remote_logs"]], expected[-500:]
+                )
+                self.assertTrue(detail["remote_logs_has_more"])
+                self.assertEqual(
+                    detail["remote_logs_before_id"], detail["remote_logs"][0]["sequence_id"]
+                )
+                older = service.job_remote_logs_page(
+                    job_id, before_id=newest["before_id"], limit=200
+                )
+                self.assertEqual([row["line"] for row in older["logs"]], expected[-400:-200])
+                terminal = ["Kaggle terminal line 1", "Kaggle terminal line 2"]
+                self.assertEqual(service.database.replace_remote_log_lines(job_id, terminal), 2)
+                replaced = service.job_remote_logs_page(job_id, limit=200)
+                self.assertEqual([row["line"] for row in replaced["logs"]], terminal)
+                self.assertFalse(replaced["has_more"])
+            finally:
+                service.close()
+
     def test_running_job_syncs_incremental_remote_logs_without_duplicates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -457,10 +664,8 @@ class SchedulerTests(unittest.TestCase):
                 )
                 job = wait_for_status(service, batch["jobs"][0]["id"], {"succeeded"})
                 synced = [
-                    line
-                    for event in job["events"]
-                    if event["message"] == "Synced live Kaggle output"
-                    for line in event["details"]["lines"]
+                    entry["line"]
+                    for entry in job["remote_logs"]
                 ]
                 self.assertEqual(
                     synced,
@@ -509,6 +714,10 @@ class SchedulerTests(unittest.TestCase):
                 job_id = batch["jobs"][0]["id"]
                 failed = wait_for_status(service, job_id, {"failed"})
                 self.assertIn("failure_output", failed["result"])
+                self.assertEqual(
+                    [entry["line"] for entry in failed["remote_logs"]],
+                    ["Traceback (most recent call last): [REDACTED]"],
+                )
                 output_dir = Path(failed["output_dir"])
                 for existing_log in output_dir.glob("*.log"):
                     existing_log.unlink()
@@ -989,6 +1198,69 @@ class SchedulerTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_restart_automatically_reconciles_cancelled_remote_uncertainty(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = make_source(root, "cancelled-recovery-source")
+            database_path = root / "state.sqlite3"
+            vault = EnvCredentialVault({"ACCOUNT_TOKEN": "token"})
+            first = ControlPlaneService(
+                database_path,
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=FakeKaggleAdapter(),
+                vault=vault,
+                start_scheduler=False,
+            )
+            try:
+                account = first.create_account(
+                    account_payload("cancelled-recovery-user", "ACCOUNT_TOKEN"), "tester"
+                )
+                batch = first.create_batch(
+                    {
+                        "name": "cancelled remote uncertainty",
+                        "jobs": [
+                            {
+                                "account_id": account["id"],
+                                "experiment_name": "cancelled locally",
+                                "source_dir": str(source),
+                                "kernel_slug": "cancelled-recovery",
+                                "metadata": {"fake_polls": 1},
+                            }
+                        ],
+                    },
+                    "tester",
+                )
+                job_id = batch["jobs"][0]["id"]
+                self.assertTrue(
+                    first.database.transition_job(
+                        job_id,
+                        {"queued"},
+                        "cancelled",
+                        fields={"remote_may_be_running": 1},
+                    )
+                )
+            finally:
+                first.close()
+
+            second = ControlPlaneService(
+                database_path,
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=FakeKaggleAdapter(),
+                vault=vault,
+                start_scheduler=False,
+            )
+            try:
+                self.assertEqual(second.recovered_jobs, 1)
+                recovered = second.get_job(job_id)
+                self.assertEqual(recovered["status"], "succeeded")
+                self.assertFalse(recovered["remote_may_be_running"])
+                account_state = second.get_account(account["id"])
+                self.assertFalse(account_state["remote_reconciliation_required"])
+            finally:
+                second.close()
+
     def test_restart_preserves_running_remote_job_and_blocks_new_work(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1066,6 +1338,106 @@ class SchedulerTests(unittest.TestCase):
                     "Kaggle remote status after restart: running",
                     "\n".join(event["message"] for event in recovered["events"]),
                 )
+            finally:
+                second.close()
+
+    def test_recovery_recheck_does_not_repeat_an_unchanged_remote_state(self) -> None:
+        class StaticQueuedAdapter(FakeKaggleAdapter):
+            def status(self, job, env, cancel_event):  # type: ignore[no-untyped-def]
+                return RemoteStatus("queued", "Kaggle still reports queued")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = ControlPlaneService(
+                root / "state.sqlite3",
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=StaticQueuedAdapter(),
+                vault=EnvCredentialVault({"ACCOUNT_TOKEN": "token"}),
+                start_scheduler=False,
+            )
+            try:
+                account = service.create_account(
+                    account_payload("quiet-recovery-user", "ACCOUNT_TOKEN"), "tester"
+                )
+                batch = service.create_batch(
+                    {
+                        "name": "quiet recovery",
+                        "jobs": [{
+                            "account_id": account["id"],
+                            "experiment_name": "queued recovery",
+                            "source_dir": str(make_source(root, "quiet-recovery-source")),
+                            "kernel_slug": "quiet-recovery",
+                        }],
+                    },
+                    "tester",
+                )
+                job_id = batch["jobs"][0]["id"]
+                self.assertTrue(service.database.transition_job(job_id, {"queued"}, "submitting"))
+                self.assertTrue(service.database.transition_job(job_id, {"submitting"}, "submitted"))
+
+                service._reconcile_recovered_jobs([job_id])
+                service._reconcile_recovered_jobs([job_id], announce_restart=False)
+                service._reconcile_recovered_jobs([job_id], announce_restart=False)
+
+                messages = [event["message"] for event in service.get_job(job_id)["events"]]
+                self.assertEqual(messages.count("Kaggle remote status after restart: queued"), 1)
+                self.assertNotIn("Kaggle remote status changed: queued", messages)
+            finally:
+                service.close()
+
+    def test_app_shutdown_preserves_remote_job_for_restart_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database_path = root / "state.sqlite3"
+            adapter = FakeKaggleAdapter(poll_delay_seconds=0.005)
+            vault = EnvCredentialVault({"ACCOUNT_TOKEN": "token"})
+            first = ControlPlaneService(
+                database_path,
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=adapter,
+                vault=vault,
+                remote_poll_seconds=0.005,
+                dispatch_poll_seconds=0.005,
+            )
+            account = first.create_account(
+                account_payload("shutdown-user", "ACCOUNT_TOKEN"), "tester"
+            )
+            batch = first.create_batch(
+                {
+                    "name": "shutdown recovery",
+                    "jobs": [{
+                        "account_id": account["id"],
+                        "experiment_name": "remote survives desktop close",
+                        "source_dir": str(make_source(root, "shutdown-source")),
+                        "kernel_slug": "shutdown-recovery",
+                        "metadata": {"fake_polls": 1000},
+                    }],
+                },
+                "tester",
+            )
+            job_id = batch["jobs"][0]["id"]
+            wait_for_status(first, job_id, {"running"})
+            first.close()
+
+            second = ControlPlaneService(
+                database_path,
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=adapter,
+                vault=vault,
+                start_scheduler=False,
+            )
+            try:
+                recovered = second.get_job(job_id)
+                self.assertEqual(recovered["status"], "running")
+                self.assertTrue(recovered["remote_may_be_running"])
+                self.assertFalse(recovered["cancel_requested"])
+                self.assertTrue(any(
+                    event["message"] == "Local monitor stopped for app shutdown; remote Kaggle run was preserved"
+                    for event in recovered["events"]
+                ))
             finally:
                 second.close()
 

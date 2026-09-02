@@ -29,6 +29,8 @@ type Account = {
   controlState?: "enabled" | "disabled" | "revoked";
   credentialAvailable?: boolean;
   remoteReconciliationRequired?: boolean;
+  remoteActiveRuns?: number;
+  remoteTerminalUncertainties?: number;
 };
 
 type QuotaResource = {
@@ -60,6 +62,7 @@ type Run = {
   logs: string[];
   logBeforeId?: number;
   hasOlderLogs?: boolean;
+  remoteLogs?: boolean;
 };
 
 type AuditEvent = {
@@ -214,6 +217,8 @@ function normalizeAccount(value: unknown, index: number): Account {
   const activeRuns = numberValue(raw, ["active_runs", "activeRuns", "running_jobs"], 0);
   const credentialAvailable = raw.credential_available !== false;
   const remoteReconciliationRequired = raw.remote_reconciliation_required === true;
+  const remoteActiveRuns = numberValue(raw, ["remote_active_runs"], 0);
+  const remoteTerminalUncertainties = numberValue(raw, ["remote_terminal_uncertainties"], 0);
   const officialQuota = (raw.official_quota && typeof raw.official_quota === "object" ? raw.official_quota : {}) as Record<string, unknown>;
   const quotaResource = (name: "gpu" | "tpu"): QuotaResource => {
     const resource = (officialQuota[name] && typeof officialQuota[name] === "object" ? officialQuota[name] : {}) as Record<string, unknown>;
@@ -224,7 +229,7 @@ function normalizeAccount(value: unknown, index: number): Account {
     id,
     owner: textValue(raw, ["owner", "owner_name", "display_name", "name"], `Member ${index + 1}`),
     username: textValue(raw, ["username", "kaggle_username", "handle"], id),
-    state: controlState === "disabled" || controlState === "revoked" || !credentialAvailable ? "offline" : remoteReconciliationRequired ? "blocked" : activeRuns > 0 ? "running" : (["ready", "running", "cooldown", "blocked", "offline"].includes(status) ? status : "ready") as AccountState,
+    state: controlState === "disabled" || controlState === "revoked" || !credentialAvailable ? "offline" : remoteActiveRuns > 0 || activeRuns > 0 ? "running" : remoteReconciliationRequired ? "blocked" : (["ready", "running", "cooldown", "blocked", "offline"].includes(status) ? status : "ready") as AccountState,
     activeRuns,
     maxParallel: numberValue(raw, ["max_parallel", "maxParallel", "concurrency"], 2),
     gpuQuota: quotaResource("gpu"),
@@ -237,6 +242,8 @@ function normalizeAccount(value: unknown, index: number): Account {
     controlState,
     credentialAvailable,
     remoteReconciliationRequired,
+    remoteActiveRuns,
+    remoteTerminalUncertainties,
   };
 }
 
@@ -267,10 +274,16 @@ function normalizeRun(value: unknown, index: number, accounts: Account[]): Run {
   const logValue = raw.logs ?? raw.log;
   const events = Array.isArray(raw.events) ? raw.events : [];
   const eventLogs = events.flatMap(eventLogLines);
+  const remoteLogValue = Array.isArray(raw.remote_logs) ? raw.remote_logs : [];
+  const remoteLogs = remoteLogValue
+    .map((item) => item && typeof item === "object" ? item as Record<string, unknown> : {})
+    .map((item) => textValue(item, ["line"], ""));
   const logs = Array.isArray(logValue)
     ? logValue.map(String)
     : typeof logValue === "string"
       ? logValue.split("\n").filter(Boolean)
+      : remoteLogs.length
+        ? remoteLogs
       : eventLogs.length
         ? eventLogs
         : ["Open this run while connected to load its event trace."];
@@ -326,12 +339,21 @@ function normalizeRun(value: unknown, index: number, accounts: Account[]): Run {
     remoteMayBeRunning: raw.remote_may_be_running === true,
     cancelSemantics: textValue(raw, ["cancel_semantics"], "") || undefined,
     logs,
-    logBeforeId: events.reduce<number | undefined>((minimum, event) => {
+    logBeforeId: remoteLogs.length
+      ? numberValue(raw, ["remote_logs_before_id"], 0) || remoteLogValue.reduce<number | undefined>((minimum, item) => {
+          const record = item && typeof item === "object" ? item as Record<string, unknown> : {};
+          const sequence = numberValue(record, ["sequence_id"], 0);
+          return sequence > 0 && (minimum === undefined || sequence < minimum) ? sequence : minimum;
+        }, undefined)
+      : events.reduce<number | undefined>((minimum, event) => {
       const item = (event && typeof event === "object" ? event : {}) as Record<string, unknown>;
       const sequence = numberValue(item, ["sequence_id"], 0);
       return sequence > 0 && (minimum === undefined || sequence < minimum) ? sequence : minimum;
     }, undefined),
-    hasOlderLogs: events.length >= 200,
+    hasOlderLogs: remoteLogs.length
+      ? raw.remote_logs_has_more === true || remoteLogs.length >= 500
+      : events.length >= 200,
+    remoteLogs: remoteLogs.length > 0,
   };
 }
 
@@ -517,11 +539,11 @@ export default function Home() {
         const activeRuns = nextRuns.filter((run) => run.accountId === account.id && (run.status === "running" || run.status === "queued")).length;
         const state: AccountState = account.controlState !== "enabled" || account.credentialAvailable === false
           ? "offline"
-          : account.remoteReconciliationRequired
-            ? "blocked"
-            : activeRuns > 0
+          : (account.remoteActiveRuns || 0) > 0 || activeRuns > 0
               ? "running"
-              : "ready";
+              : account.remoteReconciliationRequired
+                ? "blocked"
+                : "ready";
         return { ...account, activeRuns, state };
       });
     }
@@ -1086,7 +1108,6 @@ function AccountDialog({ account, connection, onClose, onFinished }: {
   const [consentNote, setConsentNote] = useState("Shared family ML workspace access");
   const [consentChecked, setConsentChecked] = useState(false);
   const [revokeText, setRevokeText] = useState("");
-  const [reconcileText, setReconcileText] = useState("");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [credentialOptions, setCredentialOptions] = useState<CredentialRefOption[]>([]);
@@ -1253,28 +1274,6 @@ function AccountDialog({ account, connection, onClose, onFinished }: {
     }
   };
 
-  const reconcile = async () => {
-    if (!account || reconcileText !== account.username) return;
-    if (isOffline) {
-      onFinished(`API offline — @${account.username} was not reconciled.`);
-      return;
-    }
-    setSubmitting(true);
-    setError("");
-    try {
-      const data = await apiRequest(`/api/accounts/${encodeURIComponent(account.id)}/reconcile`, {
-        method: "POST",
-        body: JSON.stringify({ confirmed: true, note: "Remote Kaggle state manually checked from dashboard" }),
-      });
-      const record = data && typeof data === "object" ? data as Record<string, unknown> : {};
-      const reconciledCount = numberValue(record, ["reconciled_job_count"], 0);
-      onFinished(`@${account.username} reconciled. ${reconciledCount} local job${reconciledCount === 1 ? "" : "s"} updated.`);
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Could not reconcile this account.");
-      setSubmitting(false);
-    }
-  };
-
   const syncQuota = async () => {
     if (!account || isOffline) return;
     setSubmitting(true);
@@ -1324,9 +1323,7 @@ function AccountDialog({ account, connection, onClose, onFinished }: {
 
             {account.remoteReconciliationRequired && (
               <section className="safety-action-section safety-reconcile">
-                <div><span className="safety-kicker">REMOTE STATE UNKNOWN</span><h3>Reconcile before assigning work</h3><p>A local monitor stopped while Kaggle may still be running. Check the kernel on Kaggle first, then confirm here to unblock this account.</p></div>
-                <label><span>After checking Kaggle, type <strong>{account.username}</strong></span><input value={reconcileText} onChange={(event) => setReconcileText(event.target.value)} autoComplete="off" /></label>
-                <button className="button button-primary" disabled={submitting || reconcileText !== account.username} onClick={() => void reconcile()}>Confirm reconciliation</button>
+                <div><span className="safety-kicker">REMOTE STATUS TRACKED</span><h3>{(account.remoteActiveRuns || 0) > 0 ? "Kaggle workload still running" : "Awaiting remote status confirmation"}</h3><p>{(account.remoteActiveRuns || 0) > 0 ? "New work stays paused for this account while Kaggle has an active kernel. Control Plane checks it automatically; there is nothing to unlock manually." : "A previous local monitor ended before Kaggle confirmed the final state. Control Plane retries automatically and releases scheduling only after Kaggle reports a terminal result."}</p></div>
               </section>
             )}
 
@@ -1476,9 +1473,9 @@ function BatchComposer({ accounts, connection, onClose, onCreated }: {
                   <label className="draft-field draft-account"><span>Owner / Kaggle account</span><select value={draft.accountId} onChange={(event) => updateDraft(draft.localId, { accountId: event.target.value })}>
                     <option value="">Select owner</option>
                     {accounts.map((account) => {
-                      const unavailable = account.state === "offline" || account.state === "blocked";
+                      const unavailable = account.state === "offline" || account.state === "blocked" || Boolean(account.remoteReconciliationRequired);
                       const reason = account.remoteReconciliationRequired
-                        ? "reconciliation required"
+                        ? account.remoteActiveRuns ? "Kaggle run active" : "checking remote status"
                         : account.state;
                       return <option key={account.id} value={account.id} disabled={unavailable}>{account.owner} · @{account.username}{unavailable ? ` (${reason})` : ""}</option>;
                     })}
@@ -1526,30 +1523,68 @@ function RunDrawer({ run, connection, onClose, onAction, onRefresh }: {
   onRefresh: () => void;
 }) {
   const [olderLogs, setOlderLogs] = useState<string[]>([]);
-  const [visibleLogLines, setVisibleLogLines] = useState(100);
   const [beforeId, setBeforeId] = useState(run.logBeforeId);
   const [hasOlderLogs, setHasOlderLogs] = useState(run.hasOlderLogs === true);
   const [loadingOlderLogs, setLoadingOlderLogs] = useState(false);
   const [downloading, setDownloading] = useState<"logs" | "result" | null>(null);
   const [downloadError, setDownloadError] = useState("");
   const logs = [...olderLogs, ...run.logs];
-  const shownLogs = logs.slice(-visibleLogLines);
 
   const loadOlderLogs = async () => {
     if (!beforeId || loadingOlderLogs) return;
     setLoadingOlderLogs(true);
     setDownloadError("");
     try {
-      const value = await apiRequest(`/api/jobs/${encodeURIComponent(run.id)}/events?before_id=${beforeId}&limit=200`);
+      const endpoint = run.remoteLogs ? "logs" : "events";
+      const value = await apiRequest(`/api/jobs/${encodeURIComponent(run.id)}/${endpoint}?before_id=${beforeId}&limit=200`);
       const record = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
-      const events = asList(record, ["events"]);
-      const older = events.flatMap(eventLogLines);
+      const events = asList(record, run.remoteLogs ? ["logs"] : ["events"]);
+      const older = run.remoteLogs
+        ? events.map((item) => item && typeof item === "object" ? textValue(item as Record<string, unknown>, ["line"], "") : "")
+        : events.flatMap(eventLogLines);
       setOlderLogs((current) => [...older, ...current]);
-      setVisibleLogLines((current) => current + older.length);
       setBeforeId(numberValue(record, ["before_id"], 0) || undefined);
       setHasOlderLogs(record.has_more === true);
     } catch (error) {
       setDownloadError(error instanceof Error ? error.message : "Could not load older logs.");
+    } finally {
+      setLoadingOlderLogs(false);
+    }
+  };
+
+  const loadAllOlderLogs = async () => {
+    if (!beforeId || loadingOlderLogs) return;
+    setLoadingOlderLogs(true);
+    setDownloadError("");
+    try {
+      const endpoint = run.remoteLogs ? "logs" : "events";
+      let cursor = beforeId;
+      let more = hasOlderLogs;
+      const collected: string[] = [];
+
+      // The server deliberately pages logs so that opening a very noisy run is
+      // instant.  This explicit action is the opt-in path for rendering the
+      // whole stored transcript, which makes the scrollbar useful for a quick
+      // jump anywhere in the log.
+      while (cursor && more) {
+        const value = await apiRequest(
+          `/api/jobs/${encodeURIComponent(run.id)}/${endpoint}?before_id=${cursor}&limit=500`,
+        );
+        const record = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+        const events = asList(record, run.remoteLogs ? ["logs"] : ["events"]);
+        const older = run.remoteLogs
+          ? events.map((item) => item && typeof item === "object" ? textValue(item as Record<string, unknown>, ["line"], "") : "")
+          : events.flatMap(eventLogLines);
+        if (older.length === 0) break;
+        collected.unshift(...older);
+        cursor = numberValue(record, ["before_id"], 0) || undefined;
+        more = record.has_more === true;
+      }
+      setOlderLogs((current) => [...collected, ...current]);
+      setBeforeId(cursor);
+      setHasOlderLogs(more);
+    } catch (error) {
+      setDownloadError(error instanceof Error ? error.message : "Could not load the full log.");
     } finally {
       setLoadingOlderLogs(false);
     }
@@ -1603,7 +1638,7 @@ function RunDrawer({ run, connection, onClose, onAction, onRefresh }: {
           {run.resultSummary && <div className="wide"><dt>Result preview</dt><dd><ResultPreview value={run.resultSummary} /></dd></div>}
         </dl>
         <div className="drawer-progress"><div><span>Run progress</span><strong>{run.progress}%</strong></div><div role="progressbar" aria-label="Run progress" aria-valuenow={run.progress} aria-valuemin={0} aria-valuemax={100}><i style={{ width: `${run.progress}%` }} /></div></div>
-        <section className="log-panel" aria-labelledby="log-title"><header><h3 id="log-title">Live output</h3><div><span>Kaggle sync ≤30s · {logs.length} loaded</span><button type="button" onClick={onRefresh} disabled={connection !== "live"}>Refresh</button></div></header>{hasOlderLogs && <button type="button" className="load-more-logs load-older-logs" disabled={loadingOlderLogs} onClick={() => void loadOlderLogs()}>{loadingOlderLogs ? "Loading…" : "Load 200 older lines"}</button>}<pre>{shownLogs.map((line, index) => <code key={`${line}-${index}`}><span>{String(Math.max(1, logs.length - shownLogs.length + index + 1)).padStart(2, "0")}</span>{line}</code>)}</pre>{visibleLogLines < logs.length && <button type="button" className="load-more-logs" onClick={() => setVisibleLogLines((current) => current + 200)}>Render 200 more loaded lines</button>}</section>
+        <section className="log-panel" aria-labelledby="log-title"><header><h3 id="log-title">Live output</h3><div><span>Kaggle sync ≤30s · {logs.length} lines shown</span><button type="button" onClick={onRefresh} disabled={connection !== "live"}>Refresh</button></div></header>{hasOlderLogs && <div className="log-load-actions"><button type="button" className="load-more-logs load-older-logs" disabled={loadingOlderLogs} onClick={() => void loadOlderLogs()}>{loadingOlderLogs ? "Loading…" : "Load 500 earlier lines"}</button><button type="button" className="load-more-logs load-older-logs" disabled={loadingOlderLogs} onClick={() => void loadAllOlderLogs()}>{loadingOlderLogs ? "Loading…" : "Load all earlier lines"}</button></div>}<pre>{logs.map((line, index) => <code key={`${line}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span>{line}</code>)}</pre></section>
         {downloadError && <p className="drawer-download-error" role="alert">{downloadError}</p>}
         <footer className="drawer-actions">
           {(run.status === "running" || run.status === "queued") && <button className="button button-danger" onClick={() => onAction(run, "cancel")}>Cancel run</button>}
