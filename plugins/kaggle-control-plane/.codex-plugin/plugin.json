@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Kaggle Control Plane",
     "shortDescription": "Run and diagnose Kaggle jobs safely.",
-    "longDescription": "Connects Codex to the local Kaggle Control Plane API for account and quota inspection, bounded batch submission, monitoring, cancellation, retry, and artifact download. It also preserves local guidance for reproducible model benchmarks and desktop app maintenance. Kaggle credentials remain inside Control Plane.",
+    "longDescription": "Connects Codex to the local Kaggle Control Plane API for account and quota inspection, idempotent bounded batch submission, monitoring, cancellation, retry, artifact download, and safe support bundles. It also preserves local guidance for reproducible model benchmarks and desktop app maintenance. Kaggle credentials remain inside Control Plane.",
     "developerName": "ASUS Local",
     "category": "Developer Tools",
     "capabilities": [
