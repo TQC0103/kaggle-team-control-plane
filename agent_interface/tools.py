@@ -62,6 +62,12 @@ class ToolRegistry:
                 _object_schema(
                     {
                         "name": {"type": "string", "description": "Human-readable batch name."},
+                        "idempotency_key": {
+                            "type": "string",
+                            "minLength": 8,
+                            "maxLength": 128,
+                            "pattern": "^[A-Za-z0-9._:-]+$",
+                        },
                         "experiments": {
                             "type": "array",
                             "minItems": 1,
@@ -175,6 +181,8 @@ class ToolRegistry:
             for experiment in experiments
         ]
         body = {"name": name, "jobs": jobs}
+        if "idempotency_key" in args:
+            body["idempotency_key"] = _required_string(args, "idempotency_key")
         return self.client.request("POST", "/api/batches", body=body)
 
     def _list_runs(self, args: dict[str, Any]) -> Any:

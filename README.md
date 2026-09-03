@@ -1,5 +1,7 @@
 # Kaggle Team Control Plane
 
+[![CI](https://github.com/TQC0103/kaggle-team-control-plane/actions/workflows/ci.yml/badge.svg)](https://github.com/TQC0103/kaggle-team-control-plane/actions/workflows/ci.yml)
+
 Round-1 MVP for running experiments from one Windows computer across a flexible
 registry of explicitly assigned, owner-consented Kaggle accounts. A human operator and
 an agent share the same account registry, parallel queue, job state, logs,
@@ -67,7 +69,30 @@ The helper prompts with masked input. On Windows it can save encrypted copies
 using DPAPI, so only the same Windows user on the same machine can decrypt them.
 It never writes a plaintext token to `.env`, SQLite, or the repository.
 
+The desktop app also supports per-member **Sign in with Kaggle** onboarding.
+Kaggle's official OAuth page opens in the user's browser, so passwords and 2FA
+never enter Control Plane. The returned refresh credential is kept only in the
+Windows DPAPI store; access tokens are refreshed in memory and passed only to
+the explicitly assigned job subprocess. The OAuth flow deliberately bypasses
+Kaggle's default plaintext `~/.kaggle/credentials.json` persistence.
+
 ### Windows desktop app
+
+The packaged desktop launches recurring Kaggle CLI polling and credential
+inspection without creating visible console windows, so background status
+refreshes do not steal focus or flash a terminal.
+
+Run rows, account cards, and the run drawer consume the same backend-normalized
+accelerator and elapsed-runtime fields. Completed jobs additionally surface an
+allow-listed `runtime.json` summary (Python, Torch, CUDA, device, and model
+library versions) when the downloaded artifact provides one.
+
+While a kernel is queued or running, the scheduler also samples Kaggle's live
+`kernels logs --follow` stream every 30 seconds (`KCP_LIVE_LOG_POLL_SECONDS`),
+redacts credential values, and persists only bounded incremental updates. The open run drawer refreshes
+automatically every 10 seconds and includes a manual **Refresh** button, so the
+Kaggle browser page is no longer required for routine monitoring. A temporary
+log-fetch failure is shown as a warning and does not fail the running job.
 
 Build and install the native one-click shell once:
 
@@ -83,6 +108,19 @@ add, replace, or forget encrypted Kaggle tokens and select the experiment source
 folder. Account/token/database changes are runtime data and never require a
 frontend or EXE rebuild. Only code updates require rebuilding the app.
 
+The dashboard includes first-run onboarding, run search, filtered CSV/JSON
+exports, and confirmed bulk cancel/retry actions (capped at 10 runs per action).
+Batch creation carries an idempotency key, so a browser retry cannot enqueue a
+duplicate batch. **App settings** shows the embedded version/build, checks the
+official GitHub releases feed on demand, and exports an allow-listed support
+bundle containing aggregate diagnostics only.
+
+To onboard a member without copying an API token, choose **Add member**, click
+**Sign in with Kaggle**, and finish authentication in the browser. After Kaggle
+returns to Control Plane, verify the detected owner, record explicit consent,
+and choose **Connect account**. Manual token entry remains available as a
+fallback in **App settings**.
+
 For a shareable single-file installer that provisions Kaggle CLI when needed:
 
 ```powershell
@@ -94,6 +132,37 @@ need this repository or Node.js. Setup installs Python/Kaggle CLI automatically
 when needed, so the first installation requires an internet connection.
 Their DPAPI tokens, accounts, jobs, source folder, and results are created under
 their own Windows profile and are never copied from the machine that built it.
+
+Local early-beta builds are unsigned unless a signing certificate is supplied,
+so Windows SmartScreen may show an **Unknown publisher** warning. Share the generated
+`KaggleControlPlane-Setup.exe.sha256` file alongside the installer and have the
+tester verify it before running Setup:
+
+```powershell
+(Get-FileHash .\KaggleControlPlane-Setup.exe -Algorithm SHA256).Hash
+Get-Content .\KaggleControlPlane-Setup.exe.sha256
+```
+
+The two hashes must match exactly. Only accept an installer and checksum from a
+project-owner-controlled channel; do not bypass a warning for an unexpected or
+mismatched file.
+
+### Release candidates
+
+The manually dispatched **Release candidate** GitHub Actions workflow runs the
+complete test suite on Windows, embeds the requested SemVer and commit SHA,
+builds the installer, and uploads the installer plus SHA-256 checksum as a
+14-day Actions artifact. Publishing a GitHub prerelease is an explicit workflow
+input and defaults to off.
+
+Authenticode signing is automatic when these repository secrets are configured:
+
+- `WINDOWS_SIGNING_CERTIFICATE_BASE64`: base64-encoded code-signing PFX
+- `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`: PFX password
+
+Without both secrets, the workflow clearly produces an unsigned candidate. It
+never fabricates a signature. The checksum is regenerated after installer
+signing so it always describes the distributed bytes.
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
@@ -158,7 +227,13 @@ used above, for example the absolute result of:
 Assign each experiment to its actual owner account. A kernel slug may be just
 `family-smoke-01`; the control plane prefixes and validates the assigned Kaggle
 username. The source field includes a local folder browser constrained to the
-configured `-SourceRoot`. Start with CPU smoke jobs before using accelerators.
+configured source root. GPU dispatch is pinned end-to-end to
+`NvidiaTeslaT4`: the backend writes the shape into kernel metadata and passes it
+to `kaggle kernels push --accelerator`, rather than relying on Kaggle's P100
+default. TPU dispatch similarly uses `TpuV38`; CPU jobs omit a machine shape.
+The API rejects unsupported or accelerator/shape-mismatched values.
+
+Start with CPU smoke jobs before using accelerators.
 
 The scheduler permits up to two simultaneous jobs per account and still caps a
 batch at ten jobs. A third job for the same account stays queued until one of
@@ -185,14 +260,13 @@ are downloaded only under the managed artifact root. See
 - After submission starts, Kaggle CLI has no reliable public remote-stop
   operation. Cancel/revoke stops the local CLI or monitor, but the remote kernel
   may continue.
-- Such a terminal job has `remote_may_be_running=true`; its account exposes
-  `remote_reconciliation_required=true`. New batches, retries, and dispatch are
-  blocked for that account.
-- Check that owner's kernel directly on Kaggle. Only after confirming it is no
-  longer active, open **Manage account**, type the Kaggle username, and choose
-  **Confirm reconciliation**. This clears the local uncertainty flag, writes an
-  audit event, and wakes the queue. Never reconcile while the remote run may
-  still be active.
+- Such a job has `remote_may_be_running=true`; its account pauses new batches,
+  retries, and dispatch while the remote state is checked.
+- Control Plane rechecks Kaggle automatically, including after desktop restart
+  and after a local-only cancellation. The dashboard distinguishes a confirmed
+  active remote kernel from a terminal local record awaiting confirmation; it
+  never asks an operator to type a username to "unlock" either state. Scheduling
+  resumes only after Kaggle reports a terminal result.
 
 ### Official Kaggle quota
 
@@ -256,7 +330,10 @@ GET   /api/batches
 POST  /api/batches
 GET   /api/batches/{id}
 GET   /api/jobs
+GET   /api/jobs?status=submitted&limit=20&summary=1
+GET   /api/jobs/stats
 GET   /api/jobs/{id}
+GET   /api/jobs/{id}?include_remote_logs=0&event_limit=100
 POST  /api/jobs/{id}/cancel
 POST  /api/jobs/{id}/retry
 GET   /api/jobs/{id}/result
@@ -266,9 +343,13 @@ GET   /api/jobs/{id}/result/download
 GET   /api/audit
 ```
 
-Run details render logs in bounded chunks and page older events on demand. The
-log download is UTF-8 text. A successful result download is a streamed ZIP
-containing `job-result.json` plus every managed artifact downloaded from Kaggle.
+Run details render live remote output and Control Plane events in bounded chunks
+and page older events on demand. For failed kernels, the scheduler downloads Kaggle diagnostics automatically; the
+log endpoint also fetches them on demand for failures created before this
+feature existed. Credential values are redacted from downloaded text artifacts,
+and the UTF-8 log combines Control Plane events with bounded remote `.log`
+content. A successful result download is a streamed ZIP containing
+`job-result.json` plus every managed artifact downloaded from Kaggle.
 
 ## Network and credential boundary
 
@@ -292,10 +373,15 @@ if ($errors.Count) { $errors; exit 1 }
 
 python -m py_compile scripts\demo_server.py scripts\verify_demo.py
 python -m unittest discover -s tests_backend -v
+python -m unittest discover -s tests_desktop -v
 python -m unittest discover -s agent_interface/tests -v
+python -m pytest plugins\kaggle-control-plane\scripts\test_server.py -q
 npm run lint
 npm test
 ```
+
+Pull requests and pushes to `main` run the same checks on GitHub Actions for
+Windows, the supported desktop platform.
 
 Real Kaggle execution still depends on each account's current limits,
 accelerator availability, network health, and Kaggle service behavior.

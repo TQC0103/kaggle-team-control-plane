@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -19,11 +20,76 @@ from typing import Any
 
 from control_plane.api import create_server
 from control_plane.service import ControlPlaneService
+from control_plane.version import build_identity
 
 from .credential_store import WindowsCredentialStore
+from .oauth import (
+    parse_oauth_bundle,
+    resolve_oauth_access_token,
+    run_browser_oauth,
+    serialize_oauth_bundle,
+)
 
 
 APP_NAME = "Kaggle Control Plane"
+RELEASES_API = "https://api.github.com/repos/TQC0103/kaggle-team-control-plane/releases?per_page=10"
+
+
+def _semver_key(value: str) -> tuple[int, int, int, tuple[int, str]] | None:
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", value.strip())
+    if not match:
+        return None
+    prerelease = match.group(4)
+    # A stable build sorts after its prereleases. Numeric prerelease suffixes
+    # are compared numerically for beta.2 -> beta.10 behavior.
+    if prerelease is None:
+        release_key = (1, "")
+    else:
+        normalized = re.sub(
+            r"\d+", lambda item: f"{int(item.group()):010d}", prerelease.lower()
+        )
+        release_key = (0, normalized)
+    return int(match.group(1)), int(match.group(2)), int(match.group(3)), release_key
+
+
+def update_available(current: str, latest: str) -> bool:
+    current_key = _semver_key(current)
+    latest_key = _semver_key(latest)
+    return bool(current_key and latest_key and latest_key > current_key)
+
+
+def fetch_update_status(timeout: float = 4.0) -> dict[str, Any]:
+    identity = build_identity()
+    current = str(identity["version"])
+    request = urllib.request.Request(
+        RELEASES_API,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "KaggleControlPlane"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.load(response)
+        releases = payload if isinstance(payload, list) else []
+        candidates: list[tuple[tuple[int, int, int, tuple[int, str]], dict[str, Any]]] = []
+        for release in releases:
+            if not isinstance(release, dict) or release.get("draft") is True:
+                continue
+            tag = str(release.get("tag_name") or "")
+            key = _semver_key(tag)
+            if key:
+                candidates.append((key, release))
+        if not candidates:
+            return {"ok": True, "current": current, "latest": current, "update_available": False}
+        _, latest_release = max(candidates, key=lambda item: item[0])
+        latest = str(latest_release.get("tag_name") or "").lstrip("v")
+        return {
+            "ok": True,
+            "current": current,
+            "latest": latest,
+            "update_available": update_available(current, latest),
+            "release_url": str(latest_release.get("html_url") or ""),
+        }
+    except Exception as exc:
+        return {"ok": False, "current": current, "error": f"Update check failed: {exc}"}
 
 
 def resource_root() -> Path:
@@ -87,32 +153,42 @@ class StaticDashboardHandler(SimpleHTTPRequestHandler):
 
 class DesktopBridge:
     def __init__(self, runtime: "DesktopRuntime"):
-        self.runtime = runtime
+        # pywebview publishes public bridge members recursively. Keeping the
+        # runtime public makes it walk Window/native WebView2 COM objects,
+        # which can freeze the UI and eventually hit recursion limits.
+        self._runtime = runtime
 
     def get_settings(self) -> dict[str, Any]:
         return {
             "desktop": True,
-            "source_root": str(self.runtime.source_root),
-            "credential_refs": self.runtime.credential_store.list_refs(),
-            "data_root": str(self.runtime.data_root),
-            "restart_required": self.runtime.restart_required,
+            **build_identity(),
+            "source_root": str(self._runtime.source_root),
+            "credential_refs": self._runtime.credential_store.list_refs(),
+            "data_root": str(self._runtime.data_root),
+            "restart_required": self._runtime.restart_required,
         }
 
     def save_credential(self, credential_ref: str, token: str) -> dict[str, Any]:
         try:
-            ref = self.runtime.credential_store.save(credential_ref, token)
+            ref = self._runtime.credential_store.save(credential_ref, token)
             os.environ[ref] = token
-            self.runtime.refresh_credential_refs()
+            self._runtime.refresh_credential_refs()
             return {"ok": True, "credential_ref": ref}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    def start_kaggle_oauth(self, credential_ref: str) -> dict[str, Any]:
+        return self._runtime.start_kaggle_oauth(credential_ref)
+
+    def get_kaggle_oauth_status(self) -> dict[str, Any]:
+        return self._runtime.get_kaggle_oauth_status()
+
     def forget_credential(self, credential_ref: str) -> dict[str, Any]:
         try:
-            ref = self.runtime.credential_store.validate_ref(credential_ref)
-            removed = self.runtime.credential_store.forget(ref)
+            ref = self._runtime.credential_store.validate_ref(credential_ref)
+            removed = self._runtime.credential_store.forget(ref)
             os.environ.pop(ref, None)
-            self.runtime.refresh_credential_refs()
+            self._runtime.refresh_credential_refs()
             return {"ok": True, "removed": removed}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -120,21 +196,35 @@ class DesktopBridge:
     def choose_source_root(self) -> dict[str, Any]:
         try:
             import webview
-            result = self.runtime.window.create_file_dialog(webview.FileDialog.FOLDER)
+            result = self._runtime.window.create_file_dialog(webview.FileDialog.FOLDER)
             if not result:
                 return {"ok": False, "cancelled": True}
             selected = Path(result[0]).resolve()
             config = load_config()
             config["source_root"] = str(selected)
             save_config(config)
-            self.runtime.restart_required = True
+            self._runtime.restart_required = True
             return {"ok": True, "source_root": str(selected), "restart_required": True}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
     def open_data_folder(self) -> dict[str, Any]:
         try:
-            os.startfile(self.runtime.data_root)  # type: ignore[attr-defined]
+            os.startfile(self._runtime.data_root)  # type: ignore[attr-defined]
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def check_for_updates(self) -> dict[str, Any]:
+        return fetch_update_status()
+
+    def open_external_url(self, url: str) -> dict[str, Any]:
+        try:
+            if not isinstance(url, str) or not url.startswith(
+                "https://github.com/TQC0103/kaggle-team-control-plane/releases/"
+            ):
+                raise ValueError("Only the official KCP releases page can be opened")
+            os.startfile(url)  # type: ignore[attr-defined]
             return {"ok": True}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -163,6 +253,8 @@ class DesktopRuntime:
         self.dashboard_server: ThreadingHTTPServer | None = None
         self.threads: list[threading.Thread] = []
         self.window = None
+        self._oauth_lock = threading.Lock()
+        self._oauth_status: dict[str, Any] = {"state": "idle"}
 
     def refresh_credential_refs(self) -> None:
         refs = self.credential_store.list_refs()
@@ -171,8 +263,75 @@ class DesktopRuntime:
     def load_credentials(self) -> None:
         refs = self.credential_store.list_refs()
         for ref in refs:
-            os.environ[ref] = self.credential_store.load(ref)
+            stored = self.credential_store.load(ref)
+            bundle = parse_oauth_bundle(stored)
+            if bundle is None:
+                os.environ[ref] = stored
+                continue
+            access_token = str(bundle.get("access_token") or "")
+            if access_token:
+                os.environ[ref] = access_token
         self.refresh_credential_refs()
+
+    def _refresh_oauth_credential(self, credential_ref: str) -> None:
+        stored = self.credential_store.load(credential_ref)
+        bundle = parse_oauth_bundle(stored)
+        if bundle is None:
+            return
+        access_token, refreshed = resolve_oauth_access_token(bundle)
+        self.credential_store.save(
+            credential_ref, serialize_oauth_bundle(refreshed)
+        )
+        os.environ[credential_ref] = access_token
+
+    def refresh_oauth_credentials_async(self) -> None:
+        def refresh_all() -> None:
+            for ref in self.credential_store.list_refs():
+                try:
+                    self._refresh_oauth_credential(ref)
+                except Exception:
+                    # Account availability and quota sync expose refresh failures
+                    # without leaking credential material into desktop logs.
+                    continue
+
+        threading.Thread(
+            target=refresh_all, name="kcp-oauth-refresh", daemon=True
+        ).start()
+
+    def start_kaggle_oauth(self, credential_ref: str) -> dict[str, Any]:
+        try:
+            ref = self.credential_store.validate_ref(credential_ref)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        with self._oauth_lock:
+            if self._oauth_status.get("state") == "pending":
+                return {"ok": False, "error": "Another Kaggle sign-in is already open."}
+            self._oauth_status = {"state": "pending", "credential_ref": ref}
+
+        def authenticate() -> None:
+            try:
+                username, bundle = run_browser_oauth()
+                self.credential_store.save(ref, serialize_oauth_bundle(bundle))
+                os.environ[ref] = str(bundle.get("access_token") or "")
+                self.refresh_credential_refs()
+                result = {
+                    "state": "succeeded",
+                    "credential_ref": ref,
+                    "username": username,
+                }
+            except Exception as exc:
+                result = {"state": "failed", "error": str(exc)[:500]}
+            with self._oauth_lock:
+                self._oauth_status = result
+
+        threading.Thread(
+            target=authenticate, name="kcp-oauth-login", daemon=True
+        ).start()
+        return {"ok": True, "state": "pending", "credential_ref": ref}
+
+    def get_kaggle_oauth_status(self) -> dict[str, Any]:
+        with self._oauth_lock:
+            return dict(self._oauth_status)
 
     def start(self) -> None:
         for port in (self.api_port, self.dashboard_port):
@@ -211,6 +370,7 @@ class DesktopRuntime:
             thread = threading.Thread(target=server.serve_forever, name=name, daemon=True)
             thread.start()
             self.threads.append(thread)
+        self.refresh_oauth_credentials_async()
 
     def stop(self) -> None:
         for server in (self.dashboard_server, self.api_server):

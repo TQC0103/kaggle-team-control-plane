@@ -3,25 +3,33 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import platform
 import re
 import shutil
 import subprocess
+import threading
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .adapters import (
+    DEFAULT_GPU_MACHINE_SHAPE,
     DEFAULT_MAX_SOURCE_BYTES,
+    DEFAULT_TPU_MACHINE_SHAPE,
     FakeKaggleAdapter,
     KaggleAdapter,
     KaggleCliAdapter,
+    hidden_subprocess_kwargs,
     normalize_kernel_slug,
 )
 from .credentials import EnvCredentialVault, validate_env_ref
 from .database import Database
 from .errors import ConflictError, ValidationError
 from .scheduler import JobScheduler
+from .version import build_identity
 
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$")
@@ -37,6 +45,8 @@ SECRET_INPUT_FIELDS = {
     "access_token",
     "client_secret",
 }
+GPU_MACHINE_SHAPES = {DEFAULT_GPU_MACHINE_SHAPE}
+TPU_MACHINE_SHAPES = {DEFAULT_TPU_MACHINE_SHAPE}
 
 
 def _required_text(payload: dict[str, Any], name: str, max_length: int = 500) -> str:
@@ -69,6 +79,7 @@ class ControlPlaneService:
         max_workers: int = 10,
         max_jobs_per_account: int = 2,
         remote_poll_seconds: float = 5.0,
+        live_log_poll_seconds: float = 30.0,
         dispatch_poll_seconds: float = 0.1,
         allowed_source_root: str | Path | None = None,
         max_source_bytes: int = DEFAULT_MAX_SOURCE_BYTES,
@@ -94,7 +105,14 @@ class ControlPlaneService:
             else:
                 raise ValidationError("adapter_name must be fake or kaggle")
         self.adapter = adapter
-        self.recovered_jobs = self.database.recover_interrupted_jobs()
+        self._recovery_stop = threading.Event()
+        # Recovery keeps checking a remotely active kernel after a desktop
+        # restart.  Retain its last observed state in memory so a long Kaggle
+        # queue does not flood the event history with identical polls.
+        self._recovery_observations: dict[str, str] = {}
+        self._recovery_observations_lock = threading.Lock()
+        recovered_job_ids = self.database.recover_interrupted_jobs()
+        self.recovered_jobs = len(recovered_job_ids)
         self.scheduler = JobScheduler(
             self.database,
             self.adapter,
@@ -103,6 +121,7 @@ class ControlPlaneService:
             max_workers=max_workers,
             max_jobs_per_account=max_jobs_per_account,
             remote_poll_seconds=remote_poll_seconds,
+            live_log_poll_seconds=live_log_poll_seconds,
             dispatch_poll_seconds=dispatch_poll_seconds,
             max_source_bytes=max_source_bytes,
             quota_sync_seconds=quota_sync_seconds,
@@ -110,18 +129,329 @@ class ControlPlaneService:
         )
         if start_scheduler:
             self.scheduler.start()
+            # A Kaggle CLI status command can be slow or temporarily blocked.
+            # Never make the desktop API/UI wait for that remote round trip.
+            # The preserved active state is already safe, and the scheduler
+            # will not dispatch onto its account while it is unresolved.
+            self._recovery_threads: list[threading.Thread] = []
+            # Keep every recovery independent. A slow artifact download from
+            # one completed kernel must not delay status reconciliation for a
+            # different remote kernel.
+            for job_id in recovered_job_ids:
+                thread = threading.Thread(
+                    target=self._reconcile_recovered_jobs,
+                    args=([job_id],),
+                    name=f"kcp-startup-remote-reconciliation-{job_id[-8:]}",
+                    daemon=True,
+                )
+                thread.start()
+                self._recovery_threads.append(thread)
+        else:
+            # Deterministic service construction is useful for the backend
+            # suite and other non-desktop callers.
+            self._recovery_threads = []
+            self._reconcile_recovered_jobs(recovered_job_ids)
 
     def close(self) -> None:
+        self._recovery_stop.set()
         self.scheduler.close()
+
+    def _schedule_recovered_job_recheck(self, job_id: str) -> None:
+        """Keep reconciling a remote run even if startup had no network.
+
+        A desktop close/reopen must not require a user to manually press a
+        retry button just to discover that Kaggle finished meanwhile.
+        """
+        def recheck() -> None:
+            if not self._recovery_stop.wait(30.0):
+                self._reconcile_recovered_jobs([job_id], announce_restart=False)
+
+        threading.Thread(
+            target=recheck,
+            name=f"kcp-recovery-recheck-{job_id[-8:]}",
+            daemon=True,
+        ).start()
 
     def health(self) -> dict[str, Any]:
         return {
             "status": "ok",
+            **build_identity(),
             "database": "ok",
             "adapter": self.adapter.__class__.__name__,
             "scheduler": self.scheduler.snapshot(),
             "recovered_jobs_on_start": self.recovered_jobs,
         }
+
+    def _should_report_recovery_observation(
+        self, job_id: str, observation: str, *, announce_restart: bool
+    ) -> bool:
+        """Return whether this recovery observation merits a user-facing event."""
+        with self._recovery_observations_lock:
+            previous = self._recovery_observations.get(job_id)
+            self._recovery_observations[job_id] = observation
+        return announce_restart or previous != observation
+
+    def _reconcile_recovered_jobs(
+        self, job_ids: list[str], *, announce_restart: bool = True
+    ) -> None:
+        """Refresh the true Kaggle state for jobs active when the app closed.
+
+        This runs before the scheduler accepts new work, so an existing remote
+        kernel never appears as a fabricated failure nor loses its account
+        concurrency guard.  A temporary CLI/network error leaves the job
+        active and marked uncertain; a later restart or explicit status query
+        can safely retry the check.
+        """
+        for job_id in job_ids:
+            env: dict[str, str] | None = None
+            try:
+                job = self.database.get_job(job_id)
+                account = self.database.get_account(job["account_id"])
+                credential_ref = account.get("credential_env_ref")
+                if not credential_ref:
+                    raise ValidationError("assigned account has no credential reference")
+                config_dir = (self.scheduler.config_root / f"recovery-{job_id}").resolve()
+                config_dir.mkdir(parents=True, exist_ok=True)
+                env = self.vault.build_subprocess_env(
+                    credential_ref, account["kaggle_username"], config_dir
+                )
+                remote = self.adapter.status(job, env, threading.Event())
+                safe_detail = self.scheduler._redact(remote.detail, env)
+                if self._should_report_recovery_observation(
+                    job_id, remote.state, announce_restart=announce_restart
+                ):
+                    status_prefix = (
+                        "Kaggle remote status after restart"
+                        if announce_restart
+                        else "Kaggle remote status changed"
+                    )
+                    self.database.append_job_event(
+                        job_id,
+                        f"{status_prefix}: {remote.state}",
+                        details={"detail": safe_detail},
+                        level="error" if remote.state == "failed" else "info",
+                    )
+                # A locally cancelled/failed job can still have
+                # ``remote_may_be_running`` set.  Remote status is
+                # authoritative during recovery, so include those stale local
+                # terminal labels as valid transition sources as well.
+                active_states = {
+                    "submitting", "submitted", "running", "cancel_requested",
+                    "succeeded", "failed", "cancelled",
+                }
+                if remote.state == "running":
+                    self.database.transition_job(
+                        job_id,
+                        active_states,
+                        "running",
+                        fields={"error": None, "remote_may_be_running": 1},
+                    )
+                    self._schedule_recovered_job_recheck(job_id)
+                elif remote.state == "complete":
+                    # Remote status is authoritative. Persist it before
+                    # downloading artifacts: an output transfer can be slow,
+                    # but it must not make a completed Kaggle job look active.
+                    self.database.transition_job(
+                        job_id,
+                        active_states,
+                        "succeeded",
+                        fields={
+                            "error": None,
+                            "remote_may_be_running": 0,
+                            "result": {
+                                "recovered_after_restart": True,
+                                "remote_status": safe_detail,
+                                "output_pending": True,
+                            },
+                        },
+                    )
+                    try:
+                        output = self.scheduler._redact(
+                            self.adapter.output(job, env, threading.Event()), env
+                        )
+                        self.database.transition_job(
+                            job_id,
+                            {"succeeded"},
+                            "succeeded",
+                            fields={
+                                "result": {
+                                    "recovered_after_restart": True,
+                                    "remote_status": safe_detail,
+                                    "output": output,
+                                }
+                            },
+                        )
+                    except Exception as exc:
+                        self.database.append_job_event(
+                            job_id,
+                            "Could not download completed Kaggle output after restart",
+                            details={"error": self.scheduler._redact(str(exc), env)[:2000]},
+                            level="warning",
+                        )
+                    terminal_log_lines = 0
+                    try:
+                        terminal_log = self.adapter.terminal_logs(job, env, threading.Event())
+                        terminal_log_lines = self.scheduler._replace_remote_log_text(
+                            job_id, terminal_log, env
+                        )
+                        if terminal_log_lines:
+                            self.database.append_job_event(
+                                job_id,
+                                "Reconciled complete Kaggle log after restart",
+                                details={"line_count": terminal_log_lines},
+                            )
+                    except Exception as exc:
+                        self.database.append_job_event(
+                            job_id,
+                            "Could not reconcile complete Kaggle log after restart",
+                            details={"error": self.scheduler._redact(str(exc), env)[:2000]},
+                            level="warning",
+                        )
+                    self.scheduler._schedule_terminal_log_rechecks(
+                        job_id, job["kernel_slug"], env, terminal_log_lines
+                    )
+                elif remote.state == "failed":
+                    self.database.transition_job(
+                        job_id,
+                        active_states,
+                        "failed",
+                        fields={
+                            "error": safe_detail or "Kaggle reported failure",
+                            "remote_may_be_running": 0,
+                            "result": {
+                                "recovered_after_restart": True,
+                                "remote_status": safe_detail,
+                                "diagnostics_pending": True,
+                            },
+                        },
+                    )
+                    terminal_log_lines = 0
+                    try:
+                        failure_output = self.scheduler._redact(
+                            self.adapter.diagnostics(job, env, threading.Event()), env
+                        )
+                        self.scheduler._redact_downloaded_text_files(failure_output, env)
+                        terminal_log_lines = self.scheduler._replace_remote_logs_from_download(
+                            job_id, failure_output, env
+                        )
+                        self.database.transition_job(
+                            job_id,
+                            {"failed"},
+                            "failed",
+                            fields={
+                                "result": {
+                                    "recovered_after_restart": True,
+                                    "remote_status": safe_detail,
+                                    "failure_output": failure_output,
+                                }
+                            },
+                        )
+                        if terminal_log_lines:
+                            self.database.append_job_event(
+                                job_id,
+                                "Reconciled failed Kaggle log after restart",
+                                details={"line_count": terminal_log_lines},
+                            )
+                    except Exception as exc:
+                        self.database.append_job_event(
+                            job_id,
+                            "Could not download failed Kaggle kernel diagnostics after restart",
+                            details={"error": self.scheduler._redact(str(exc), env)[:2000]},
+                            level="warning",
+                        )
+                    self.scheduler._schedule_terminal_log_rechecks(
+                        job_id, job["kernel_slug"], env, terminal_log_lines
+                    )
+                elif remote.state == "cancelled":
+                    self.database.transition_job(
+                        job_id,
+                        active_states,
+                        "cancelled",
+                        fields={
+                            "error": safe_detail or "Kaggle reported cancellation",
+                            "remote_may_be_running": 0,
+                            "result": {
+                                "recovered_after_restart": True,
+                                "remote_status": safe_detail,
+                            },
+                        },
+                    )
+                # Kaggle may briefly report queued. ``submitted`` remains the
+                # local representation of a successfully submitted kernel.
+                elif remote.state == "queued":
+                    self.database.transition_job(
+                        job_id,
+                        active_states,
+                        "submitted",
+                        fields={"error": None, "remote_may_be_running": 1},
+                    )
+                    self._schedule_recovered_job_recheck(job_id)
+                else:
+                    self.database.append_job_event(
+                        job_id,
+                        "Kaggle returned an unrecognised state after restart; keeping job active",
+                        details={"remote_state": remote.state, "detail": safe_detail},
+                        level="warning",
+                    )
+                    self._schedule_recovered_job_recheck(job_id)
+            except Exception as exc:
+                if self._should_report_recovery_observation(
+                    job_id, "error", announce_restart=announce_restart
+                ):
+                    message = (
+                        "Could not reconcile Kaggle state after restart; "
+                        "keeping job active and retrying automatically"
+                        if announce_restart
+                        else "Could not reconcile Kaggle state; keeping job active and retrying automatically"
+                    )
+                    self.database.append_job_event(
+                        job_id,
+                        message,
+                        details={"error": self.scheduler._redact(str(exc), env)[:2000]},
+                        level="warning",
+                    )
+                self._schedule_recovered_job_recheck(job_id)
+
+    @staticmethod
+    def _decorate_job(job: dict[str, Any]) -> dict[str, Any]:
+        decorated = dict(job)
+        metadata = decorated.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        accelerator = str(metadata.get("accelerator") or "cpu")
+        decorated["accelerator"] = accelerator
+        decorated["machine_shape"] = metadata.get("machine_shape")
+
+        result = decorated.get("result")
+        output = result.get("output") if isinstance(result, dict) else None
+        runtime = output.get("runtime") if isinstance(output, dict) else None
+        decorated["runtime"] = runtime if isinstance(runtime, dict) else None
+
+        started_at = decorated.get("remote_started_at") or decorated.get("started_at")
+        finished_at = decorated.get("finished_at")
+        if isinstance(started_at, str):
+            try:
+                start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                end = (
+                    datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+                    if isinstance(finished_at, str)
+                    else datetime.now(timezone.utc)
+                )
+                decorated["elapsed_seconds"] = max(0, int((end - start).total_seconds()))
+            except ValueError:
+                decorated["elapsed_seconds"] = None
+        else:
+            decorated["elapsed_seconds"] = None
+        return decorated
+
+    @classmethod
+    def _decorate_batch(cls, batch: dict[str, Any]) -> dict[str, Any]:
+        decorated = dict(batch)
+        jobs = decorated.get("jobs")
+        if isinstance(jobs, list):
+            decorated["jobs"] = [
+                cls._decorate_job(job) if isinstance(job, dict) else job for job in jobs
+            ]
+        return decorated
 
     @staticmethod
     def _reject_secrets(payload: dict[str, Any]) -> None:
@@ -205,6 +535,7 @@ class ControlPlaneService:
                     errors="replace",
                     timeout=20,
                     check=False,
+                    **hidden_subprocess_kwargs(),
                 )
             except subprocess.TimeoutExpired as exc:
                 raise ValidationError("Kaggle credential inspection timed out") from exc
@@ -418,6 +749,14 @@ class ControlPlaneService:
 
     def create_batch(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
         name = _required_text(payload, "name", 300)
+        idempotency_key = payload.get("idempotency_key")
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not re.fullmatch(
+                r"[A-Za-z0-9._:-]{8,128}", idempotency_key
+            ):
+                raise ValidationError(
+                    "idempotency_key must be 8-128 URL-safe characters"
+                )
         raw_jobs = payload.get("jobs")
         if not isinstance(raw_jobs, list) or not raw_jobs:
             raise ValidationError("jobs must be a non-empty list")
@@ -432,6 +771,7 @@ class ControlPlaneService:
             metadata = raw.get("metadata") or {}
             if not isinstance(metadata, dict):
                 raise ValidationError(f"jobs[{index}].metadata must be an object")
+            metadata = dict(metadata)
             self._reject_nested_secrets(metadata, f"jobs[{index}].metadata")
             accelerator = metadata.get("accelerator", "cpu")
             if accelerator == "auto":
@@ -441,6 +781,29 @@ class ControlPlaneService:
                 raise ValidationError(
                     f"jobs[{index}].metadata.accelerator must be gpu, tpu, or cpu"
                 )
+            machine_shape = metadata.get("machine_shape")
+            if accelerator == "gpu":
+                machine_shape = machine_shape or DEFAULT_GPU_MACHINE_SHAPE
+                if machine_shape not in GPU_MACHINE_SHAPES:
+                    raise ValidationError(
+                        f"jobs[{index}].metadata.machine_shape must be "
+                        f"{DEFAULT_GPU_MACHINE_SHAPE} for GPU jobs"
+                    )
+                metadata["machine_shape"] = machine_shape
+            elif accelerator == "tpu":
+                machine_shape = machine_shape or DEFAULT_TPU_MACHINE_SHAPE
+                if machine_shape not in TPU_MACHINE_SHAPES:
+                    raise ValidationError(
+                        f"jobs[{index}].metadata.machine_shape must be "
+                        f"{DEFAULT_TPU_MACHINE_SHAPE} for TPU jobs"
+                    )
+                metadata["machine_shape"] = machine_shape
+            elif machine_shape not in {None, ""}:
+                raise ValidationError(
+                    f"jobs[{index}].metadata.machine_shape is not valid for CPU jobs"
+                )
+            else:
+                metadata.pop("machine_shape", None)
             self._ensure_account_dispatchable(
                 account, accelerator=accelerator, location=f"jobs[{index}] account"
             )
@@ -481,15 +844,58 @@ class ControlPlaneService:
                     "metadata": metadata,
                 }
             )
-        batch = self.database.create_batch(name, specs, actor, self.artifact_root)
+        canonical_request = json.dumps(
+            {"name": name, "jobs": specs}, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        request_hash = hashlib.sha256(canonical_request).hexdigest()
+        batch = self.database.create_batch(
+            name,
+            specs,
+            actor,
+            self.artifact_root,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash if idempotency_key else None,
+        )
         self.scheduler.wake()
-        return batch
+        return self._decorate_batch(batch)
+
+    def support_bundle_download(self) -> tuple[str, Path]:
+        """Create an allow-listed diagnostic archive with no credential material."""
+        downloads = (self.data_dir / "downloads").resolve()
+        downloads.mkdir(parents=True, exist_ok=True)
+        archive_path = downloads / "kcp-support-bundle.zip"
+        temporary_path = archive_path.with_suffix(".zip.tmp")
+        accounts = self.list_accounts()
+        payload = {
+            **build_identity(),
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "platform": {
+                "system": platform.system(),
+                "release": platform.release(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+            },
+            "health": self.health(),
+            "job_state_counts": self.job_state_counts(),
+            "account_summary": {
+                "total": len(accounts),
+                "enabled": sum(1 for account in accounts if account["state"] == "enabled"),
+            },
+        }
+        with zipfile.ZipFile(temporary_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "support.json", json.dumps(payload, indent=2, sort_keys=True) + "\n"
+            )
+        temporary_path.replace(archive_path)
+        return archive_path.name, archive_path
 
     def list_batches(self) -> list[dict[str, Any]]:
-        return self.database.list_batches()
+        return [self._decorate_batch(batch) for batch in self.database.list_batches()]
 
     def get_batch(self, batch_id: str) -> dict[str, Any]:
-        return self.database.get_batch(batch_id, include_jobs=True)
+        return self._decorate_batch(
+            self.database.get_batch(batch_id, include_jobs=True)
+        )
 
     def list_jobs(
         self,
@@ -497,18 +903,171 @@ class ControlPlaneService:
         batch_id: str | None = None,
         account_id: str | None = None,
         status: str | None = None,
+        limit: int | None = None,
+        summary: bool = False,
     ) -> list[dict[str, Any]]:
-        return self.database.list_jobs(
-            batch_id=batch_id, account_id=account_id, status=status
+        jobs = [
+            self._decorate_job(job)
+            for job in self.database.list_jobs(
+                batch_id=batch_id,
+                account_id=account_id,
+                status=status,
+                limit=limit,
+            )
+        ]
+        if summary:
+            for job in jobs:
+                job.pop("result", None)
+        return jobs
+
+    def job_state_counts(self) -> dict[str, int]:
+        return self.database.job_state_counts()
+
+    def get_job(
+        self,
+        job_id: str,
+        *,
+        include_remote_logs: bool = True,
+        event_limit: int = 200,
+        remote_log_limit: int = 500,
+    ) -> dict[str, Any]:
+        return self._decorate_job(
+            self.database.get_job(
+                job_id,
+                include_remote_logs=include_remote_logs,
+                event_limit=event_limit,
+                remote_log_limit=remote_log_limit,
+            )
         )
 
-    def get_job(self, job_id: str) -> dict[str, Any]:
-        return self.database.get_job(job_id)
+    def job_remote_logs_page(
+        self, job_id: str, *, before_id: int | None = None, limit: int = 200
+    ) -> dict[str, Any]:
+        self.database.get_job(job_id)
+        bounded_limit = max(1, min(limit, 500))
+        lines = self.database.list_remote_log_lines(
+            job_id, limit=bounded_limit + 1, before_id=before_id
+        )
+        has_more = len(lines) > bounded_limit
+        if has_more:
+            lines = lines[1:]
+        return {
+            "logs": lines,
+            "before_id": lines[0]["sequence_id"] if lines else None,
+            "has_more": has_more,
+        }
+
+    def remote_job_status(self, job_id: str) -> dict[str, Any]:
+        """Read the remote Kaggle state for an interrupted local monitor.
+
+        Authentication is resolved only by the in-process credential vault and
+        is passed directly to the adapter's short-lived child process.  The
+        response is redacted before it crosses the local HTTP boundary.
+        """
+        job = self.database.get_job(job_id)
+        account = self.database.get_account(job["account_id"])
+        credential_ref = account.get("credential_env_ref")
+        if not credential_ref:
+            raise ValidationError("assigned account has no credential reference")
+        config_dir = (self.scheduler.config_root / f"status-{job_id}").resolve()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        env = self.vault.build_subprocess_env(
+            credential_ref, account["kaggle_username"], config_dir
+        )
+        remote = self.adapter.status(job, env, threading.Event())
+        result = {
+            "job_id": job_id,
+            "kernel_slug": job["kernel_slug"],
+            "remote_state": remote.state,
+            "detail": self.scheduler._redact(remote.detail, env),
+        }
+        if remote.state == "failed":
+            diagnostic = self.adapter.diagnostics(job, env, threading.Event())
+            files = diagnostic.get("files", [])
+            log_tail = ""
+            if isinstance(files, list) and files:
+                log_path = Path(job["output_dir"]).resolve() / str(files[0])
+                if log_path.is_file():
+                    log_tail = log_path.read_text(encoding="utf-8", errors="replace")[-20000:]
+            result["diagnostic"] = {
+                "files": files,
+                "log_tail": self.scheduler._redact(log_tail, env),
+            }
+            self.database.transition_job(
+                job_id,
+                {"submitted", "running", "cancel_requested"},
+                "failed",
+                fields={
+                    "error": result["detail"] or "Kaggle reported failure",
+                    "remote_may_be_running": 0,
+                },
+            )
+        elif remote.state == "complete":
+            output = self.adapter.output(job, env, threading.Event())
+            safe_output = self.scheduler._redact(output, env)
+            result["output"] = safe_output
+            # An on-demand status check can be the first successful query after
+            # a transient scheduler timeout.  It has already downloaded the
+            # output above, so leave the persisted job in the same terminal
+            # state as the normal scheduler path.  Without this transition the
+            # UI says "submitted" even though artifacts exist, and a durable
+            # chained benchmark can never submit its successor.
+            stored = self.database.get_job(job_id)
+            if stored["status"] in {"submitted", "running"}:
+                prior_result = stored.get("result") or {}
+                completed_result = {
+                    "submit": prior_result.get("submit"),
+                    "remote_status": result["detail"],
+                    "output": safe_output,
+                }
+                if completed_result["submit"] is None:
+                    completed_result.pop("submit")
+                changed = self.database.transition_job(
+                    job_id,
+                    {"submitted", "running"},
+                    "succeeded",
+                    fields={
+                        "result": completed_result,
+                        "error": None,
+                        "remote_may_be_running": 0,
+                    },
+                )
+                if changed:
+                    self.database.append_job_event(
+                        job_id,
+                        "Persisted completed Kaggle status after on-demand check",
+                        details={
+                            "output_dir": safe_output.get("output_dir"),
+                            "file_count": len(safe_output.get("files", [])),
+                        },
+                    )
+            else:
+                # The remote result is terminal even if the local job had
+                # already been marked uncertain by a transient CLI outage.
+                self.database.transition_job(
+                    job_id,
+                    {"cancel_requested"},
+                    "succeeded",
+                    fields={
+                        "result": {
+                            "remote_status": result["detail"],
+                            "output": safe_output,
+                        },
+                        "error": None,
+                        "remote_may_be_running": 0,
+                    },
+                )
+        return result
 
     def cancel_job(self, job_id: str, actor: str) -> dict[str, Any]:
         job, semantics = self.database.request_cancel(job_id, actor)
         self.scheduler.request_cancel(job_id)
-        return {"job": job, "cancel_semantics": semantics}
+        if semantics == "local_monitor_stop_requested":
+            # Kaggle's public CLI cannot stop a submitted kernel by slug.  Do
+            # not make the operator clear a guard by hand: keep checking the
+            # remote job until Kaggle itself reports a terminal state.
+            self._schedule_recovered_job_recheck(job_id)
+        return {"job": self._decorate_job(job), "cancel_semantics": semantics}
 
     def retry_job(self, job_id: str, actor: str) -> dict[str, Any]:
         original = self.database.get_job(job_id)
@@ -520,10 +1079,11 @@ class ControlPlaneService:
         )
         retry = self.database.retry_job(job_id, actor, self.artifact_root)
         self.scheduler.wake()
-        return retry
+        return self._decorate_job(retry)
 
     def job_result(self, job_id: str) -> dict[str, Any]:
         job = self.database.get_job(job_id)
+        decorated = self._decorate_job(job)
         return {
             "job_id": job_id,
             "status": job["status"],
@@ -533,10 +1093,15 @@ class ControlPlaneService:
             "output_dir": job["output_dir"],
             "remote_may_be_running": job["remote_may_be_running"],
             "events": job["events"],
+            "accelerator": decorated["accelerator"],
+            "machine_shape": decorated["machine_shape"],
+            "elapsed_seconds": decorated["elapsed_seconds"],
+            "runtime": decorated["runtime"],
         }
 
     def job_logs_download(self, job_id: str) -> tuple[str, Path]:
         job = self.database.get_job(job_id)
+        remote_logs = self._failed_remote_logs(job)
         events = self.database.list_job_events(job_id, limit=10000)
         downloads = (self.data_dir / "downloads").resolve()
         downloads.mkdir(parents=True, exist_ok=True)
@@ -561,8 +1126,88 @@ class ControlPlaneService:
                     f"[{str(event.get('level', 'info')).upper()}] "
                     f"{event.get('message', '')}{detail_text}\n"
                 )
+            live_log_bytes = 20 * 1024 * 1024
+            live_logs = self.database.list_remote_log_lines(job["id"], limit=50000)
+            if live_logs:
+                output.write("\n=== Kaggle live output (captured verbatim) ===\n")
+                for entry in live_logs:
+                    line = str(entry.get("line", ""))
+                    encoded = (line + "\n").encode("utf-8", errors="replace")
+                    if len(encoded) > live_log_bytes:
+                        output.write("[live output download truncated at 20 MiB]\n")
+                        break
+                    output.write(line + "\n")
+                    live_log_bytes -= len(encoded)
+            remaining_bytes = 5 * 1024 * 1024
+            output_dir = Path(job["output_dir"]).resolve()
+            for remote_log in remote_logs[:20]:
+                if remaining_bytes <= 0:
+                    break
+                payload = remote_log.read_bytes()[:remaining_bytes]
+                remaining_bytes -= len(payload)
+                relative = str(remote_log.relative_to(output_dir))
+                output.write(f"\n=== Kaggle remote log: {relative} ===\n")
+                output.write(payload.decode("utf-8", errors="replace"))
+                if payload and not payload.endswith(b"\n"):
+                    output.write("\n")
         temporary_path.replace(log_path)
         return log_path.name, log_path
+
+    def _failed_remote_logs(self, job: dict[str, Any]) -> list[Path]:
+        if job["status"] != "failed":
+            return []
+        output_dir = Path(job["output_dir"]).resolve()
+        artifact_root = self.artifact_root.resolve()
+        if not output_dir.is_relative_to(artifact_root):
+            raise ValidationError("job output directory is outside the managed artifact root")
+        existing = (
+            sorted(path.resolve() for path in output_dir.rglob("*.log"))
+            if output_dir.is_dir()
+            else []
+        )
+        existing = [
+            path
+            for path in existing
+            if (
+                path.is_file()
+                and path.stat().st_size > 0
+                and path.is_relative_to(output_dir)
+            )
+        ]
+        if existing:
+            return existing
+
+        account = self.database.get_account(job["account_id"])
+        credential_ref = account.get("credential_env_ref")
+        if not credential_ref:
+            return []
+        config_dir = (self.data_dir / "kaggle-config" / job["id"]).resolve()
+        config_dir.mkdir(parents=True, exist_ok=True)
+        env = self.vault.build_subprocess_env(
+            credential_ref, account["kaggle_username"], config_dir
+        )
+        try:
+            raw_output = self.adapter.diagnostics(job, env, threading.Event())
+            JobScheduler._redact_downloaded_text_files(raw_output, env)
+            safe_output = JobScheduler._redact(raw_output, env)
+            self.database.append_job_event(
+                job["id"],
+                "Downloaded failed Kaggle kernel diagnostics on demand",
+                details={"file_count": len(safe_output.get("files", []))},
+            )
+        except Exception as exc:
+            self.database.append_job_event(
+                job["id"],
+                "Could not download failed Kaggle kernel diagnostics on demand",
+                details={"error": JobScheduler._redact(str(exc), env)},
+                level="warning",
+            )
+            return []
+        return sorted(
+            path.resolve()
+            for path in output_dir.rglob("*.log")
+            if path.is_file() and path.resolve().is_relative_to(output_dir)
+        )
 
     def job_events_page(
         self, job_id: str, *, before_id: int | None = None, limit: int = 200

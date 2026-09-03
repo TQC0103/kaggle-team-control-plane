@@ -16,6 +16,9 @@ from .errors import ConflictError, NotFoundError
 
 TERMINAL_JOB_STATES = {"succeeded", "failed", "cancelled"}
 ACTIVE_JOB_STATES = {"submitting", "submitted", "running", "cancel_requested"}
+LEGACY_RESTART_FAILURE = (
+    "control plane restarted while this job was active; verify Kaggle remotely"
+)
 
 
 def utc_now() -> str:
@@ -77,6 +80,8 @@ class Database:
                 CREATE TABLE IF NOT EXISTS batches (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    request_hash TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -114,6 +119,8 @@ class Database:
                 CREATE INDEX IF NOT EXISTS jobs_account_status_idx
                     ON jobs(account_id, status);
                 CREATE INDEX IF NOT EXISTS jobs_batch_idx ON jobs(batch_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS batches_idempotency_idx
+                    ON batches(idempotency_key) WHERE idempotency_key IS NOT NULL;
 
                 CREATE TABLE IF NOT EXISTS job_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,6 +134,22 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS job_events_job_idx
                     ON job_events(job_id, id DESC);
+
+                -- Live Kaggle output is deliberately stored outside
+                -- ``job_events``.  A single CLI snapshot can contain hundreds
+                -- of lines, which used to overflow the small JSON details
+                -- field and silently turn the whole event into
+                -- {"truncated": true}.  These are already redacted by the
+                -- scheduler before they reach the database.
+                CREATE TABLE IF NOT EXISTS job_remote_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL REFERENCES jobs(id),
+                    line TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS job_remote_logs_job_idx
+                    ON job_remote_logs(job_id, id DESC);
 
                 CREATE TABLE IF NOT EXISTS audit_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,6 +178,18 @@ class Database:
                 )
             if "remote_started_at" not in job_columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN remote_started_at TEXT")
+            batch_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(batches)").fetchall()
+            }
+            if "idempotency_key" not in batch_columns:
+                connection.execute("ALTER TABLE batches ADD COLUMN idempotency_key TEXT")
+            if "request_hash" not in batch_columns:
+                connection.execute("ALTER TABLE batches ADD COLUMN request_hash TEXT")
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS batches_idempotency_idx "
+                "ON batches(idempotency_key) WHERE idempotency_key IS NOT NULL"
+            )
             account_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(accounts)").fetchall()
@@ -258,6 +293,81 @@ class Database:
                 "created_at": row["created_at"],
             }
             for row in rows
+        ]
+
+    def append_remote_log_lines(self, job_id: str, lines: list[str]) -> int:
+        """Persist bounded, already-redacted Kaggle output line by line.
+
+        Keeping the original line boundaries lets the dashboard render the
+        actual Kaggle stream instead of a lossy scheduler-event summary.
+        """
+        now = utc_now()
+        prepared = [
+            (job_id, str(line).replace("\x00", "")[:32768], now)
+            for line in lines
+        ]
+        if not prepared:
+            return 0
+        with self.connection() as connection:
+            connection.executemany(
+                "INSERT INTO job_remote_logs (job_id,line,created_at) VALUES (?,?,?)",
+                prepared,
+            )
+            # Enough headroom for long scientific runs, but a noisy notebook
+            # must not grow the desktop database forever.
+            connection.execute(
+                "DELETE FROM job_remote_logs WHERE job_id=? AND id NOT IN "
+                "(SELECT id FROM job_remote_logs WHERE job_id=? "
+                "ORDER BY id DESC LIMIT 50000)",
+                (job_id, job_id),
+            )
+        return len(prepared)
+
+    def replace_remote_log_lines(self, job_id: str, lines: list[str]) -> int:
+        """Atomically replace the live tail with Kaggle's terminal log.
+
+        A bounded ``--follow`` snapshot can start mid-stream or end in the
+        middle of a progress line.  Once Kaggle publishes its immutable final
+        log, it is the authoritative version rendered by the web UI.
+        """
+        now = utc_now()
+        prepared = [
+            (job_id, str(line).replace("\x00", "")[:32768], now)
+            for line in lines
+        ][-50000:]
+        with self.connection() as connection:
+            connection.execute("DELETE FROM job_remote_logs WHERE job_id=?", (job_id,))
+            if prepared:
+                connection.executemany(
+                    "INSERT INTO job_remote_logs (job_id,line,created_at) VALUES (?,?,?)",
+                    prepared,
+                )
+        return len(prepared)
+
+    def list_remote_log_lines(
+        self, job_id: str, limit: int = 200, before_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(limit, 1000))
+        with self.connection() as connection:
+            if before_id is None:
+                rows = connection.execute(
+                    "SELECT id,line,created_at FROM job_remote_logs "
+                    "WHERE job_id=? ORDER BY id DESC LIMIT ?",
+                    (job_id, bounded_limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT id,line,created_at FROM job_remote_logs "
+                    "WHERE job_id=? AND id<? ORDER BY id DESC LIMIT ?",
+                    (job_id, before_id, bounded_limit),
+                ).fetchall()
+        return [
+            {
+                "sequence_id": row["id"],
+                "line": row["line"],
+                "created_at": row["created_at"],
+            }
+            for row in reversed(rows)
         ]
 
     @staticmethod
@@ -390,13 +500,26 @@ class Database:
         account = dict(account)
         account_id = account["id"]
         with self.connection() as connection:
-            unresolved = connection.execute(
-                "SELECT 1 FROM jobs WHERE account_id=? "
-                "AND status IN ('succeeded','failed','cancelled') "
-                "AND remote_may_be_running=1 LIMIT 1",
+            # After a Control Plane restart, an active job can still be running
+            # on Kaggle even though there is no in-process scheduler worker for
+            # it yet. Treat that as unresolved as well: otherwise a restart
+            # could allow two more GPU submissions and exceed the account's
+            # actual remote concurrency.
+            unresolved_rows = connection.execute(
+                "SELECT status FROM jobs WHERE account_id=? "
+                "AND remote_may_be_running=1",
                 (account_id,),
-            ).fetchone()
-        account["remote_reconciliation_required"] = bool(unresolved)
+            ).fetchall()
+        # Keep the dispatch guard, but expose *why* an account is guarded.
+        # A confirmed remote run is not something the operator can or should
+        # manually "unlock".  Only a terminal local record whose remote state
+        # is still unknown is a genuine uncertainty.
+        remote_active_runs = sum(
+            row["status"] in ACTIVE_JOB_STATES for row in unresolved_rows
+        )
+        account["remote_active_runs"] = remote_active_runs
+        account["remote_terminal_uncertainties"] = len(unresolved_rows) - remote_active_runs
+        account["remote_reconciliation_required"] = bool(unresolved_rows)
         account["official_quota"] = {
             "source": "kaggle",
             "synced_at": account.get("official_quota_synced_at"),
@@ -542,16 +665,31 @@ class Database:
         job_specs: list[dict[str, Any]],
         actor: str,
         default_output_root: Path,
+        *,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
     ) -> dict[str, Any]:
         batch_id = new_id("batch")
         now = utc_now()
         jobs: list[dict[str, Any]] = []
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if idempotency_key:
+                existing = connection.execute(
+                    "SELECT id,request_hash FROM batches WHERE idempotency_key=?",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing:
+                    if existing["request_hash"] != request_hash:
+                        raise ConflictError(
+                            "idempotency_key was already used for a different batch request"
+                        )
+                    return self.get_batch(existing["id"], include_jobs=True)
             connection.execute(
-                "INSERT INTO batches (id,name,created_by,created_at,updated_at) "
-                "VALUES (?,?,?,?,?)",
-                (batch_id, name, actor, now, now),
+                "INSERT INTO batches "
+                "(id,name,idempotency_key,request_hash,created_by,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (batch_id, name, idempotency_key, request_hash, actor, now, now),
             )
             for spec in job_specs:
                 job_id = new_id("job")
@@ -641,13 +779,37 @@ class Database:
             ).fetchall()
         return [self.get_batch(row["id"]) for row in rows]
 
-    def get_job(self, job_id: str) -> dict[str, Any]:
+    def get_job(
+        self,
+        job_id: str,
+        *,
+        include_remote_logs: bool = False,
+        event_limit: int = 200,
+        remote_log_limit: int = 500,
+    ) -> dict[str, Any]:
         with self.connection() as connection:
             row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         job = self._decode(row, "job")
         if not job:
             raise NotFoundError(f"job {job_id!r} was not found")
-        job["events"] = self.list_job_events(job_id)
+        job["events"] = self.list_job_events(job_id, limit=event_limit)
+        # Scheduler paths call ``get_job`` frequently.  Do not load a large
+        # live-output page for every poll; the run-detail API explicitly opts
+        # in below.  Fetch one sentinel line to make the UI pagination state
+        # exact instead of guessing from a page that happens to be full.
+        if include_remote_logs:
+            bounded_log_limit = max(1, min(remote_log_limit, 500))
+            remote_logs = self.list_remote_log_lines(
+                job_id, limit=bounded_log_limit + 1
+            )
+            has_more = len(remote_logs) > bounded_log_limit
+            if has_more:
+                remote_logs = remote_logs[1:]
+            job["remote_logs"] = remote_logs
+            job["remote_logs_before_id"] = (
+                remote_logs[0]["sequence_id"] if remote_logs else None
+            )
+            job["remote_logs_has_more"] = has_more
         return job
 
     def list_jobs(
@@ -656,9 +818,10 @@ class Database:
         batch_id: str | None = None,
         account_id: str | None = None,
         status: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         filters: list[str] = []
-        params: list[str] = []
+        params: list[Any] = []
         for column, value in (
             ("batch_id", batch_id),
             ("account_id", account_id),
@@ -668,12 +831,26 @@ class Database:
                 filters.append(f"{column} = ?")
                 params.append(value)
         where = " WHERE " + " AND ".join(filters) if filters else ""
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = " LIMIT ?"
+            params.append(max(1, min(limit, 1000)))
         with self.connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM jobs" + where + " ORDER BY created_at DESC, rowid DESC",
+                "SELECT * FROM jobs"
+                + where
+                + " ORDER BY created_at DESC, rowid DESC"
+                + limit_clause,
                 params,
             ).fetchall()
         return [self._decode(row, "job") for row in rows]  # type: ignore[misc]
+
+    def job_state_counts(self) -> dict[str, int]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM jobs GROUP BY status"
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
 
     def queued_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.connection() as connection:
@@ -699,7 +876,9 @@ class Database:
         changes["updated_at"] = now
         if to_state == "submitting":
             changes.setdefault("started_at", now)
-        if to_state == "submitted":
+        # Recovery can safely reaffirm ``submitted`` after an app restart.
+        # That must not reset the remote runtime clock used by the UI.
+        if to_state == "submitted" and "submitted" not in from_states:
             changes.setdefault("remote_started_at", now)
         if to_state in TERMINAL_JOB_STATES:
             changes.setdefault("finished_at", now)
@@ -708,6 +887,9 @@ class Database:
         assignments = ", ".join(f"{key}=?" for key in changes)
         placeholders = ",".join("?" for _ in from_states)
         with self.connection() as connection:
+            previous = connection.execute(
+                "SELECT status FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
             cursor = connection.execute(
                 f"UPDATE jobs SET {assignments} WHERE id=? "  # noqa: S608
                 f"AND status IN ({placeholders})",
@@ -723,13 +905,14 @@ class Database:
                     {"quota_source": "official_kaggle_api"},
                     connection=connection,
                 )
-                self.append_job_event(
-                    job_id,
-                    f"Job status changed to {to_state}",
-                    level="error" if to_state == "failed" else "info",
-                    details={"quota_source": "official_kaggle_api"},
-                    connection=connection,
-                )
+                if previous and previous["status"] != to_state:
+                    self.append_job_event(
+                        job_id,
+                        f"Job status changed to {to_state}",
+                        level="error" if to_state == "failed" else "info",
+                        details={"quota_source": "official_kaggle_api"},
+                        connection=connection,
+                    )
         return changed
 
     def request_cancel(self, job_id: str, actor: str) -> tuple[dict[str, Any], str]:
@@ -821,20 +1004,34 @@ class Database:
             )
         return self.get_job(retry_id)
 
-    def recover_interrupted_jobs(self) -> int:
+    def recover_interrupted_jobs(self) -> list[str]:
+        """Preserve active remote jobs for startup reconciliation.
+
+        Closing the desktop app only stops the local monitor; it does not stop
+        a Kaggle kernel.  Do not manufacture a local ``failed`` result here.
+        The service reconciles these ids with Kaggle after its scheduler and
+        credential vault are ready.
+        """
         now = utc_now()
-        placeholders = ",".join("?" for _ in ACTIVE_JOB_STATES)
         with self.connection() as connection:
-            rows = connection.execute(
-                f"SELECT id,status FROM jobs WHERE status IN ({placeholders})",  # noqa: S608
-                sorted(ACTIVE_JOB_STATES),
+            # Older schedulers marked any attempted submit as remotely
+            # uncertain, even when Kaggle returned a definite client error.
+            # Repair only rows whose immutable event trace proves that a
+            # failure was persisted before any successful submit event.
+            legacy_rejected = connection.execute(
+                "SELECT jobs.id FROM jobs WHERE remote_may_be_running=1 "
+                "AND (result_json IS NULL OR result_json='null') "
+                "AND EXISTS (SELECT 1 FROM job_events WHERE job_id=jobs.id "
+                "AND message='Job status changed to failed') "
+                "AND NOT EXISTS (SELECT 1 FROM job_events WHERE job_id=jobs.id "
+                "AND message='Submitted the staged kernel to Kaggle')"
             ).fetchall()
-            for row in rows:
+            for row in legacy_rejected:
                 connection.execute(
-                    "UPDATE jobs SET status='failed', remote_may_be_running=1, "
-                    "error=?, finished_at=?, updated_at=? WHERE id=?",
+                    "UPDATE jobs SET status='failed',remote_may_be_running=0,"
+                    "error=?,finished_at=COALESCE(finished_at,?),updated_at=? WHERE id=?",
                     (
-                        "control plane restarted while this job was active; verify Kaggle remotely",
+                        "legacy submit failure; Kaggle did not accept a remote kernel",
                         now,
                         now,
                         row["id"],
@@ -842,7 +1039,39 @@ class Database:
                 )
                 self.append_audit(
                     "scheduler",
-                    "job.recovered_as_failed",
+                    "job.legacy_submit_failure_repaired",
+                    "job",
+                    row["id"],
+                    {"remote_submission_confirmed": False},
+                    connection=connection,
+                )
+                self.append_job_event(
+                    row["id"],
+                    "Repaired legacy submit failure; no remote Kaggle run was accepted",
+                    level="warning",
+                    connection=connection,
+                )
+            rows = connection.execute(
+                "SELECT id,status FROM jobs WHERE status IN "
+                "('submitting','submitted','running','cancel_requested') "
+                "OR remote_may_be_running=1 "
+                "OR (status='failed' AND error=?)",
+                (LEGACY_RESTART_FAILURE,),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    "UPDATE jobs SET status=CASE WHEN status IN ('submitting','failed') "
+                    "THEN 'submitted' ELSE status END, remote_may_be_running=1, "
+                    "error=?, finished_at=NULL, updated_at=? WHERE id=?",
+                    (
+                        "control plane restarted; reconciling remote Kaggle status",
+                        now,
+                        row["id"],
+                    ),
+                )
+                self.append_audit(
+                    "scheduler",
+                    "job.recovery_pending",
                     "job",
                     row["id"],
                     {"previous_status": row["status"]},
@@ -850,11 +1079,11 @@ class Database:
                 )
                 self.append_job_event(
                     row["id"],
-                    "Control plane restarted; verify the remote Kaggle run",
-                    level="error",
+                    "Control plane restarted; reconciling the remote Kaggle run",
+                    level="warning",
                     connection=connection,
                 )
-        return len(rows)
+        return [str(row["id"]) for row in rows]
 
     def list_audit(
         self,

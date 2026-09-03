@@ -16,3 +16,8 @@ files are excluded by `.gitignore`.
 The supplied control plane binds to loopback by default. Do not port-forward it
 or expose it to an untrusted network without adding an authenticated reverse
 proxy and reviewing the deployment boundary.
+
+The support bundle is generated from an explicit allow-list. It contains build
+identity, operating-system/Python versions, service health, aggregate job-state
+counts, and aggregate account counts. It excludes usernames, credential
+references and values, paths, job metadata, logs, artifacts, and database files.

@@ -12,6 +12,11 @@ type AccountState = "ready" | "running" | "cooldown" | "blocked" | "offline";
 type RunState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 type ConnectionState = "checking" | "live" | "partial" | "offline";
 
+type BuildInfo = {
+  version: string;
+  buildSha: string;
+};
+
 type Account = {
   id: string;
   owner: string;
@@ -29,6 +34,8 @@ type Account = {
   controlState?: "enabled" | "disabled" | "revoked";
   credentialAvailable?: boolean;
   remoteReconciliationRequired?: boolean;
+  remoteActiveRuns?: number;
+  remoteTerminalUncertainties?: number;
 };
 
 type QuotaResource = {
@@ -45,6 +52,9 @@ type Run = {
   username: string;
   status: RunState;
   accelerator: string;
+  acceleratorKind: string;
+  machineShape?: string;
+  runtimeInfo?: Record<string, string>;
   sourcePath: string;
   progress: number;
   createdAt: string;
@@ -57,6 +67,7 @@ type Run = {
   logs: string[];
   logBeforeId?: number;
   hasOlderLogs?: boolean;
+  remoteLogs?: boolean;
 };
 
 type AuditEvent = {
@@ -75,6 +86,7 @@ type DraftExperiment = {
   sourcePath: string;
   kernelSlug: string;
   accelerator: string;
+  machineShape: string;
 };
 
 type CredentialRefOption = {
@@ -103,23 +115,35 @@ type DesktopSettings = {
   credential_refs: string[];
   data_root: string;
   restart_required: boolean;
+  version?: string;
+  build_sha?: string;
 };
 
 type DesktopResult = {
   ok: boolean;
+  state?: "idle" | "pending" | "succeeded" | "failed";
   error?: string;
   cancelled?: boolean;
   credential_ref?: string;
   source_root?: string;
   restart_required?: boolean;
+  username?: string;
+  current?: string;
+  latest?: string;
+  update_available?: boolean;
+  release_url?: string;
 };
 
 type DesktopApi = {
   get_settings: () => Promise<DesktopSettings>;
   save_credential: (credentialRef: string, token: string) => Promise<DesktopResult>;
+  start_kaggle_oauth: (credentialRef: string) => Promise<DesktopResult>;
+  get_kaggle_oauth_status: () => Promise<DesktopResult>;
   forget_credential: (credentialRef: string) => Promise<DesktopResult>;
   choose_source_root: () => Promise<DesktopResult>;
   open_data_folder: () => Promise<DesktopResult>;
+  check_for_updates: () => Promise<DesktopResult>;
+  open_external_url: (url: string) => Promise<DesktopResult>;
 };
 
 declare global {
@@ -158,6 +182,49 @@ function numberValue(record: Record<string, unknown>, keys: string[], fallback =
   return fallback;
 }
 
+function objectValue(record: Record<string, unknown>, key: string) {
+  const value = record[key];
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function formatDuration(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  const whole = Math.floor(seconds);
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const remainingSeconds = whole % 60;
+  return hours > 0
+    ? `${hours}h ${String(minutes).padStart(2, "0")}m`
+    : `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s`;
+}
+
+function downloadTextFile(filename: string, content: string, contentType: string) {
+  const blob = new Blob([content], { type: contentType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function acceleratorLabel(accelerator: string, machineShape: string) {
+  const kind = accelerator.toLowerCase();
+  if (kind === "gpu") {
+    const device = machineShape === "NvidiaTeslaT4" ? "Tesla T4" : machineShape;
+    return device ? `GPU · ${device}` : "GPU";
+  }
+  if (kind === "tpu") {
+    const device = machineShape === "TpuV38" ? "V3-8" : machineShape;
+    return device ? `TPU · ${device}` : "TPU";
+  }
+  return kind === "cpu" ? "CPU" : accelerator || "Unknown";
+}
+
 function normalizeStatus(value: string): RunState {
   const status = value.toLowerCase();
   if (["complete", "completed", "success", "succeeded"].includes(status)) return "succeeded";
@@ -175,6 +242,8 @@ function normalizeAccount(value: unknown, index: number): Account {
   const activeRuns = numberValue(raw, ["active_runs", "activeRuns", "running_jobs"], 0);
   const credentialAvailable = raw.credential_available !== false;
   const remoteReconciliationRequired = raw.remote_reconciliation_required === true;
+  const remoteActiveRuns = numberValue(raw, ["remote_active_runs"], 0);
+  const remoteTerminalUncertainties = numberValue(raw, ["remote_terminal_uncertainties"], 0);
   const officialQuota = (raw.official_quota && typeof raw.official_quota === "object" ? raw.official_quota : {}) as Record<string, unknown>;
   const quotaResource = (name: "gpu" | "tpu"): QuotaResource => {
     const resource = (officialQuota[name] && typeof officialQuota[name] === "object" ? officialQuota[name] : {}) as Record<string, unknown>;
@@ -185,7 +254,7 @@ function normalizeAccount(value: unknown, index: number): Account {
     id,
     owner: textValue(raw, ["owner", "owner_name", "display_name", "name"], `Member ${index + 1}`),
     username: textValue(raw, ["username", "kaggle_username", "handle"], id),
-    state: controlState === "disabled" || controlState === "revoked" || !credentialAvailable ? "offline" : remoteReconciliationRequired ? "blocked" : activeRuns > 0 ? "running" : (["ready", "running", "cooldown", "blocked", "offline"].includes(status) ? status : "ready") as AccountState,
+    state: controlState === "disabled" || controlState === "revoked" || !credentialAvailable ? "offline" : remoteActiveRuns > 0 || activeRuns > 0 ? "running" : remoteReconciliationRequired ? "blocked" : (["ready", "running", "cooldown", "blocked", "offline"].includes(status) ? status : "ready") as AccountState,
     activeRuns,
     maxParallel: numberValue(raw, ["max_parallel", "maxParallel", "concurrency"], 2),
     gpuQuota: quotaResource("gpu"),
@@ -198,6 +267,8 @@ function normalizeAccount(value: unknown, index: number): Account {
     controlState,
     credentialAvailable,
     remoteReconciliationRequired,
+    remoteActiveRuns,
+    remoteTerminalUncertainties,
   };
 }
 
@@ -207,28 +278,62 @@ function quotaText(resource: QuotaResource) {
     : `${resource.remainingHours.toFixed(1)} / ${resource.totalHours.toFixed(1)}h`;
 }
 
+function eventLogLines(event: unknown): string[] {
+  const item = (event && typeof event === "object" ? event : {}) as Record<string, unknown>;
+  const timestamp = textValue(item, ["created_at", "time", "timestamp"], "");
+  const shortTime = timestamp.includes("T") ? timestamp.split("T")[1]?.slice(0, 8) : timestamp;
+  const level = textValue(item, ["level"], "info").toUpperCase();
+  const message = textValue(item, ["message", "detail"], "Job event");
+  const prefix = `${shortTime || "--:--:--"}`;
+  const details = objectValue(item, "details");
+  const remoteLines = Array.isArray(details.lines)
+    ? details.lines.map((line) => `${prefix}  REMOTE  ${String(line)}`)
+    : [];
+  return [`${prefix}  ${level.padEnd(7)} ${message}`, ...remoteLines];
+}
+
 function normalizeRun(value: unknown, index: number, accounts: Account[]): Run {
   const raw = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
   const accountId = textValue(raw, ["account_id", "accountId", "owner_id"], "");
   const account = accounts.find((item) => item.id === accountId);
   const logValue = raw.logs ?? raw.log;
   const events = Array.isArray(raw.events) ? raw.events : [];
-  const eventLogs = events.map((event) => {
-    const item = (event && typeof event === "object" ? event : {}) as Record<string, unknown>;
-    const timestamp = textValue(item, ["created_at", "time", "timestamp"], "");
-    const shortTime = timestamp.includes("T") ? timestamp.split("T")[1]?.slice(0, 8) : timestamp;
-    const level = textValue(item, ["level"], "info").toUpperCase();
-    const message = textValue(item, ["message", "detail"], "Job event");
-    return `${shortTime || "--:--:--"}  ${level.padEnd(7)} ${message}`;
-  });
+  const eventLogs = events.flatMap(eventLogLines);
+  const remoteLogValue = Array.isArray(raw.remote_logs) ? raw.remote_logs : [];
+  const remoteLogs = remoteLogValue
+    .map((item) => item && typeof item === "object" ? item as Record<string, unknown> : {})
+    .map((item) => textValue(item, ["line"], ""));
   const logs = Array.isArray(logValue)
     ? logValue.map(String)
     : typeof logValue === "string"
       ? logValue.split("\n").filter(Boolean)
+      : remoteLogs.length
+        ? remoteLogs
       : eventLogs.length
         ? eventLogs
         : ["Open this run while connected to load its event trace."];
   const resultValue = raw.result;
+  const metadata = objectValue(raw, "metadata");
+  const result = objectValue(raw, "result");
+  const output = objectValue(result, "output");
+  const runtimeSource = Object.keys(objectValue(raw, "runtime")).length
+    ? objectValue(raw, "runtime")
+    : objectValue(output, "runtime");
+  const runtimeInfo = Object.fromEntries(
+    Object.entries(runtimeSource)
+      .filter(([, item]) => ["string", "number", "boolean"].includes(typeof item))
+      .map(([key, item]) => [key, String(item)]),
+  );
+  const acceleratorKind = textValue(
+    raw,
+    ["accelerator"],
+    textValue(metadata, ["accelerator"], "cpu"),
+  );
+  const machineShape = textValue(
+    raw,
+    ["machine_shape"],
+    textValue(metadata, ["machine_shape"], ""),
+  );
   const resultSummary = resultValue && typeof resultValue === "object"
     ? JSON.stringify(resultValue)
     : typeof resultValue === "string"
@@ -241,23 +346,39 @@ function normalizeRun(value: unknown, index: number, accounts: Account[]): Run {
     owner: textValue(raw, ["owner", "owner_name"], account?.owner || "Unassigned"),
     username: textValue(raw, ["username", "account_username"], account?.username || "unknown"),
     status: normalizeStatus(textValue(raw, ["status", "state"], "queued")),
-    accelerator: textValue(raw, ["accelerator", "gpu"], "Auto"),
+    accelerator: acceleratorLabel(acceleratorKind, machineShape),
+    acceleratorKind,
+    machineShape: machineShape || undefined,
+    runtimeInfo: Object.keys(runtimeInfo).length ? runtimeInfo : undefined,
     sourcePath: textValue(raw, ["source_dir", "source_path", "sourcePath", "kernel_ref", "kernel_slug"], "—"),
     progress: Math.min(100, Math.max(0, numberValue(raw, ["progress", "percent"], 0))),
     createdAt: textValue(raw, ["created_at", "createdAt", "started_at"], "—"),
-    duration: textValue(raw, ["duration", "elapsed"], "—"),
+    duration: textValue(
+      raw,
+      ["duration", "elapsed"],
+      formatDuration(numberValue(raw, ["elapsed_seconds"], Number.NaN)),
+    ),
     metric: textValue(raw, ["metric", "score"], "") || undefined,
     outputDir: textValue(raw, ["output_dir", "outputDir"], "") || undefined,
     resultSummary,
     remoteMayBeRunning: raw.remote_may_be_running === true,
     cancelSemantics: textValue(raw, ["cancel_semantics"], "") || undefined,
     logs,
-    logBeforeId: events.reduce<number | undefined>((minimum, event) => {
+    logBeforeId: remoteLogs.length
+      ? numberValue(raw, ["remote_logs_before_id"], 0) || remoteLogValue.reduce<number | undefined>((minimum, item) => {
+          const record = item && typeof item === "object" ? item as Record<string, unknown> : {};
+          const sequence = numberValue(record, ["sequence_id"], 0);
+          return sequence > 0 && (minimum === undefined || sequence < minimum) ? sequence : minimum;
+        }, undefined)
+      : events.reduce<number | undefined>((minimum, event) => {
       const item = (event && typeof event === "object" ? event : {}) as Record<string, unknown>;
       const sequence = numberValue(item, ["sequence_id"], 0);
       return sequence > 0 && (minimum === undefined || sequence < minimum) ? sequence : minimum;
     }, undefined),
-    hasOlderLogs: events.length >= 200,
+    hasOlderLogs: remoteLogs.length
+      ? raw.remote_logs_has_more === true || remoteLogs.length >= 500
+      : events.length >= 200,
+    remoteLogs: remoteLogs.length > 0,
   };
 }
 
@@ -391,27 +512,47 @@ export default function Home() {
   const [selectedRun, setSelectedRun] = useState<Run | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | RunState>("all");
+  const [runSearch, setRunSearch] = useState("");
+  const [selectedRunIds, setSelectedRunIds] = useState<string[]>([]);
+  const [buildInfo, setBuildInfo] = useState<BuildInfo>({
+    version: "0.2.0-beta.1",
+    buildSha: "development",
+  });
 
-  const openRun = async (run: Run) => {
-    setSelectedRun(run);
+  const refreshRunDetail = useCallback(async (runId: string, quiet = false) => {
     if (connection !== "live") return;
     try {
-      const data = await apiRequest(`/api/jobs/${encodeURIComponent(run.id)}`);
+      const data = await apiRequest(`/api/jobs/${encodeURIComponent(runId)}`);
       const record = data && typeof data === "object" ? data as Record<string, unknown> : {};
       const rawJob = record.job ?? data;
       const detailed = normalizeRun(rawJob, 0, accounts);
-      setSelectedRun({ ...run, ...detailed, owner: run.owner, username: run.username });
+      setSelectedRun((current) => current?.id === runId
+        ? { ...current, ...detailed, owner: current.owner, username: current.username }
+        : current);
     } catch (error) {
-      setToast(`Could not load run detail: ${error instanceof Error ? error.message : "unknown error"}`);
+      if (!quiet) setToast(`Could not load run detail: ${error instanceof Error ? error.message : "unknown error"}`);
     }
+  }, [accounts, connection]);
+
+  const openRun = async (run: Run) => {
+    setSelectedRun(run);
+    await refreshRunDetail(run.id);
   };
+
+  const selectedRunId = selectedRun?.id;
+  useEffect(() => {
+    if (!selectedRunId || connection !== "live") return;
+    const timer = window.setInterval(() => { void refreshRunDetail(selectedRunId, true); }, 10000);
+    return () => window.clearInterval(timer);
+  }, [selectedRunId, connection, refreshRunDetail]);
 
   const refresh = useCallback(async (quiet = false) => {
     if (!quiet) setRefreshing(true);
     const results = await Promise.allSettled([
       apiRequest("/api/accounts"),
-      apiRequest("/api/jobs"),
+      apiRequest("/api/jobs?limit=500&summary=1"),
       apiRequest("/api/audit"),
+      apiRequest("/api/health"),
     ]);
 
     const fulfilled = results.filter((item) => item.status === "fulfilled").length;
@@ -430,11 +571,11 @@ export default function Home() {
         const activeRuns = nextRuns.filter((run) => run.accountId === account.id && (run.status === "running" || run.status === "queued")).length;
         const state: AccountState = account.controlState !== "enabled" || account.credentialAvailable === false
           ? "offline"
-          : account.remoteReconciliationRequired
-            ? "blocked"
-            : activeRuns > 0
+          : (account.remoteActiveRuns || 0) > 0 || activeRuns > 0
               ? "running"
-              : "ready";
+              : account.remoteReconciliationRequired
+                ? "blocked"
+                : "ready";
         return { ...account, activeRuns, state };
       });
     }
@@ -443,10 +584,18 @@ export default function Home() {
       const list = asList(auditResult.value, ["audit", "events", "audit_events", "items", "data"]);
       setAuditEvents(list.map(normalizeAudit));
     }
+    const healthResult = results[3];
+    if (healthResult.status === "fulfilled" && healthResult.value && typeof healthResult.value === "object") {
+      const health = healthResult.value as Record<string, unknown>;
+      setBuildInfo({
+        version: textValue(health, ["version"], "0.2.0-beta.1"),
+        buildSha: textValue(health, ["build_sha"], "development"),
+      });
+    }
 
     if (accountResult.status === "fulfilled") setAccounts(nextAccounts);
 
-    setConnection(fulfilled === 3 ? "live" : fulfilled > 0 ? "partial" : "offline");
+    setConnection(fulfilled === 4 ? "live" : fulfilled > 0 ? "partial" : "offline");
     setRefreshing(false);
   }, [accounts]);
 
@@ -503,7 +652,63 @@ export default function Home() {
   const remainingTpuQuota = accounts.reduce((sum, item) => sum + (item.tpuQuota.remainingHours || 0), 0);
   const completedCount = runs.filter((run) => run.status === "succeeded").length;
   const scoredRun = runs.find((run) => run.metric);
-  const filteredRuns = filter === "all" ? runs : runs.filter((run) => run.status === filter);
+  const filteredRuns = runs.filter((run) => {
+    if (filter !== "all" && run.status !== filter) return false;
+    const query = runSearch.trim().toLowerCase();
+    return !query || [run.name, run.owner, run.username, run.sourcePath, run.status, run.accelerator]
+      .some((value) => value.toLowerCase().includes(query));
+  });
+
+  const exportRuns = (format: "json" | "csv") => {
+    const exported = filteredRuns.map((run) => ({
+      id: run.id,
+      experiment: run.name,
+      owner: run.owner,
+      kaggle_account: run.username,
+      status: run.status,
+      accelerator: run.accelerator,
+      source: run.sourcePath,
+      created_at: run.createdAt,
+      runtime: run.duration,
+      metric: run.metric || "",
+    }));
+    if (format === "json") {
+      downloadTextFile("kcp-runs.json", `${JSON.stringify(exported, null, 2)}\n`, "application/json");
+      return;
+    }
+    const headers = ["id", "experiment", "owner", "kaggle_account", "status", "accelerator", "source", "created_at", "runtime", "metric"] as const;
+    const escape = (value: unknown) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+    const csv = [headers.join(","), ...exported.map((row) => headers.map((key) => escape(row[key])).join(","))].join("\r\n");
+    downloadTextFile("kcp-runs.csv", `${csv}\r\n`, "text/csv;charset=utf-8");
+  };
+
+  const actionableSelection = (action: "cancel" | "retry") => selectedRunIds
+    .map((id) => runs.find((run) => run.id === id))
+    .filter((run): run is Run => Boolean(run) && (action === "cancel"
+      ? run!.status === "running" || run!.status === "queued"
+      : run!.status === "failed" || run!.status === "cancelled"))
+    .slice(0, 10);
+
+  const bulkRunAction = async (action: "cancel" | "retry") => {
+    if (connection !== "live") {
+      setToast("Control-plane API is not fully connected.");
+      return;
+    }
+    const targets = actionableSelection(action);
+    if (!targets.length) {
+      setToast(`No selected runs can be ${action === "cancel" ? "cancelled" : "retried"}.`);
+      return;
+    }
+    if (!window.confirm(`${action === "cancel" ? "Cancel" : "Retry"} ${targets.length} selected run${targets.length === 1 ? "" : "s"}?`)) return;
+    const results = await Promise.allSettled(targets.map((run) => apiRequest(
+      `/api/jobs/${encodeURIComponent(run.id)}/${action}`,
+      { method: "POST" },
+    )));
+    const succeeded = results.filter((result) => result.status === "fulfilled").length;
+    setSelectedRunIds([]);
+    setToast(`${action === "cancel" ? "Cancel" : "Retry"}: ${succeeded}/${targets.length} accepted.`);
+    await refresh(true);
+  };
 
   const connectionLabel = connection === "live"
     ? "Control plane live"
@@ -591,7 +796,7 @@ export default function Home() {
       <main id="main-content" className="main-content">
         <header className="topbar">
           <div>
-            <p className="eyebrow">Family ML workspace <span>/</span> v0.1</p>
+            <p className="eyebrow">Family ML workspace <span>/</span> v{buildInfo.version} <span>/</span> {buildInfo.buildSha.slice(0, 12)}</p>
             <h1>Experiment command center</h1>
           </div>
           <div className="topbar-actions">
@@ -616,6 +821,14 @@ export default function Home() {
             <p><strong>No sample accounts are loaded.</strong> Start the real control-plane API at <code>{API_BASE}</code>, then refresh to connect owner accounts.</p>
             <button onClick={() => void refresh()}>Try connection</button>
           </div>
+        )}
+
+        {connection === "live" && accounts.length === 0 && (
+          <section className="onboarding-panel" aria-labelledby="onboarding-title">
+            <div><p className="section-label">FIRST RUN</p><h2 id="onboarding-title">Set up your first Kaggle owner.</h2><p>Choose an experiment folder, connect an owner credential, confirm consent, then launch a CPU smoke run before using accelerator quota.</p></div>
+            <ol><li><strong>1</strong><span>Choose the managed source folder</span></li><li><strong>2</strong><span>Sign in with Kaggle or save a token</span></li><li><strong>3</strong><span>Connect the consenting owner account</span></li></ol>
+            <div>{desktopAvailable && <button className="button button-quiet" onClick={() => setDesktopSettingsOpen(true)}>App settings</button>}<button className="button button-primary" onClick={() => setAccountFormOpen(true)}>Add first member</button></div>
+          </section>
         )}
 
         <section id="overview" className="overview-section section-anchor" aria-labelledby="overview-title">
@@ -689,6 +902,14 @@ export default function Home() {
           <div className="account-grid">
             {accounts.length === 0 && <div className="empty-state"><strong>No accounts connected.</strong><span>Start the real API, then use Add member for each consenting owner.</span></div>}
             {accounts.map((account, index) => {
+              const activeAccelerators = Array.from(new Set(
+                runs
+                  .filter((run) => run.accountId === account.id && (run.status === "running" || run.status === "queued"))
+                  .map((run) => run.accelerator),
+              ));
+              const accountAccelerator = activeAccelerators.length
+                ? activeAccelerators.join(" + ")
+                : "Idle";
               return (
                 <article className={`account-card account-${account.state}`} key={account.id}>
                   <div className="account-topline">
@@ -706,7 +927,7 @@ export default function Home() {
                     </div>
                   )}
                   <div className="account-specs">
-                    <span><small>ACCELERATOR</small><strong>{account.accelerator}</strong></span>
+                    <span><small>ACTIVE ACCELERATOR</small><strong>{accountAccelerator}</strong></span>
                     <span><small>RUNS</small><strong>{account.activeRuns}/{account.maxParallel}</strong></span>
                   </div>
                   <div className="account-quota">
@@ -727,19 +948,20 @@ export default function Home() {
               <p className="section-label">LIVE QUEUE</p>
               <h2 id="runs-title">Experiments in motion.</h2>
             </div>
-            <div className="filter-tabs" role="group" aria-label="Filter runs">
+            <div className="run-tools"><label className="run-search"><span className="sr-only">Search runs</span><input value={runSearch} onChange={(event) => setRunSearch(event.target.value)} placeholder="Search runs…" /></label>{selectedRunIds.length > 0 && <div className="bulk-actions" aria-label="Selected run actions"><span>{selectedRunIds.length} selected</span><button type="button" onClick={() => void bulkRunAction("cancel")}>Cancel</button><button type="button" onClick={() => void bulkRunAction("retry")}>Retry</button><button type="button" onClick={() => setSelectedRunIds([])}>Clear</button></div>}<div className="export-actions"><button type="button" onClick={() => exportRuns("csv")}>CSV</button><button type="button" onClick={() => exportRuns("json")}>JSON</button></div><div className="filter-tabs" role="group" aria-label="Filter runs">
               {(["all", "running", "queued", "succeeded", "failed"] as const).map((item) => (
                 <button key={item} className={filter === item ? "active" : ""} aria-pressed={filter === item} onClick={() => setFilter(item)}>{item}</button>
               ))}
-            </div>
+            </div></div>
           </div>
 
           <div className="run-table-wrap">
             <table className="run-table">
-              <thead><tr><th scope="col">Experiment</th><th scope="col">Owner / account</th><th scope="col">Status</th><th scope="col">Progress</th><th scope="col">Runtime</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
+              <thead><tr><th scope="col" className="select-column"><input type="checkbox" aria-label="Select all visible runs" checked={filteredRuns.length > 0 && filteredRuns.every((run) => selectedRunIds.includes(run.id))} onChange={(event) => setSelectedRunIds((current) => event.target.checked ? Array.from(new Set([...current, ...filteredRuns.map((run) => run.id)])) : current.filter((id) => !filteredRuns.some((run) => run.id === id)))} /></th><th scope="col">Experiment</th><th scope="col">Owner / account</th><th scope="col">Status</th><th scope="col">Progress</th><th scope="col">Runtime</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
               <tbody>
                 {filteredRuns.map((run) => (
                   <tr key={run.id}>
+                    <td className="select-column"><input type="checkbox" aria-label={`Select ${run.name}`} checked={selectedRunIds.includes(run.id)} onChange={(event) => setSelectedRunIds((current) => event.target.checked ? [...current, run.id] : current.filter((id) => id !== run.id))} /></td>
                     <td><button className="run-name" onClick={() => void openRun(run)}><strong>{run.name}</strong><span>{run.sourcePath}</span></button></td>
                     <td><div className="run-owner"><span>{run.owner.slice(0, 1)}</span><div><strong>{run.owner}</strong><small>@{run.username}</small></div></div></td>
                     <td><StatusBadge status={run.status} /></td>
@@ -750,7 +972,7 @@ export default function Home() {
                     <td><button className="row-action" onClick={() => void openRun(run)} aria-label={`Open ${run.name} details`}>Open <span>↗</span></button></td>
                   </tr>
                 ))}
-                {!filteredRuns.length && <tr><td colSpan={6} className="empty-state">No runs match this filter.</td></tr>}
+                {!filteredRuns.length && <tr><td colSpan={7} className="empty-state">No runs match this filter.</td></tr>}
               </tbody>
             </table>
           </div>
@@ -787,7 +1009,7 @@ export default function Home() {
           </div>
         </section>
 
-        <footer className="page-footer"><p>Kaggle Team Control Plane <span>·</span> MVP round 01</p><p>Credentials stay behind the local control plane.</p></footer>
+        <footer className="page-footer"><p>Kaggle Team Control Plane <span>·</span> v{buildInfo.version} <span>·</span> {buildInfo.buildSha.slice(0, 12)}</p><p>Credentials stay behind the local control plane.</p></footer>
       </main>
 
       {composerOpen && (
@@ -805,10 +1027,12 @@ export default function Home() {
 
       {selectedRun && (
         <RunDrawer
+          key={selectedRun.id}
           run={selectedRun}
           connection={connection}
           onClose={() => setSelectedRun(null)}
           onAction={runAction}
+          onRefresh={() => void refreshRunDetail(selectedRun.id)}
         />
       )}
 
@@ -849,6 +1073,9 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
   const [credentialRef, setCredentialRef] = useState("");
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
+  const [oauthBusy, setOauthBusy] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState<DesktopResult | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [error, setError] = useState("");
 
   const reload = useCallback(async () => {
@@ -887,6 +1114,34 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
     await reload();
   };
 
+  const signInWithKaggle = async () => {
+    const api = window.pywebview?.api;
+    if (!api || !credentialRef.trim() || oauthBusy) return;
+    setOauthBusy(true);
+    setError("");
+    const started = await api.start_kaggle_oauth(credentialRef.trim());
+    if (!started.ok) {
+      setOauthBusy(false);
+      setError(started.error || "Could not start Kaggle sign-in.");
+      return;
+    }
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      const status = await api.get_kaggle_oauth_status();
+      if (status.state === "pending") continue;
+      setOauthBusy(false);
+      if (status.state === "succeeded") {
+        await reload();
+        onChanged(`${status.credential_ref || credentialRef} connected as @${status.username || "Kaggle member"}.`);
+      } else {
+        setError(status.error || "Kaggle sign-in did not complete.");
+      }
+      return;
+    }
+    setOauthBusy(false);
+    setError("Kaggle sign-in timed out. You can start it again.");
+  };
+
   const forgetToken = async (ref: string) => {
     if (!window.confirm(`Forget the encrypted token ${ref}? Its account will become unavailable.`)) return;
     const result = await window.pywebview?.api.forget_credential(ref);
@@ -908,8 +1163,19 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
     onChanged("Source folder saved. Restart the app once to activate it.");
   };
 
+  const checkUpdates = async () => {
+    const api = window.pywebview?.api;
+    if (!api || checkingUpdate) return;
+    setCheckingUpdate(true);
+    setError("");
+    const result = await api.check_for_updates();
+    setCheckingUpdate(false);
+    setUpdateStatus(result);
+    if (!result.ok) setError(result.error || "Could not check for updates.");
+  };
+
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <div className="modal-layer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="account-dialog desktop-settings" role="dialog" aria-modal="true" aria-labelledby="desktop-settings-title">
         <header className="composer-header">
           <div><p className="section-label">WINDOWS APP</p><h2 id="desktop-settings-title">Local app settings.</h2><p>Tokens and accounts are runtime data. Changing them never rebuilds the app.</p></div>
@@ -919,6 +1185,10 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
           {error && <p className="form-error" role="alert">{error}</p>}
           <section className="settings-section">
             <div><p className="section-label">ENCRYPTED TOKENS</p><h3>Owner credentials</h3></div>
+            <div className="oauth-onboarding">
+              <div><strong>Sign in with Kaggle</strong><span>Password and 2FA stay in Kaggle&apos;s browser. OAuth credentials are encrypted with Windows DPAPI.</span></div>
+              <button className="button button-primary" type="button" disabled={oauthBusy || !credentialRef.trim()} onClick={() => void signInWithKaggle()}>{oauthBusy ? "Waiting for Kaggle…" : "Sign in with Kaggle"}</button>
+            </div>
             <div className="credential-list">
               {settings?.credential_refs.map((ref) => (
                 <div key={ref}><code>{ref}</code><button type="button" onClick={() => { setCredentialRef(ref); setToken(""); }}>Replace</button><button type="button" className="danger-link" onClick={() => void forgetToken(ref)}>Forget</button></div>
@@ -936,6 +1206,13 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
             <code className="settings-path">{settings?.source_root || "Loading…"}</code>
             <div className="settings-actions"><button className="button button-quiet" type="button" onClick={() => void chooseSource()}>Browse folder</button><button className="button button-quiet" type="button" onClick={() => void window.pywebview?.api.open_data_folder()}>Open app data</button></div>
             {settings?.restart_required && <p className="restart-note">Restart the app to activate the new source folder. Token changes are already active.</p>}
+          </section>
+          <section className="settings-section">
+            <div><p className="section-label">SUPPORT</p><h3>Diagnostics and build</h3></div>
+            <p className="settings-version">Version <strong>{settings?.version || "0.2.0-beta.1"}</strong> · build <code>{settings?.build_sha || "development"}</code></p>
+            <div className="settings-actions"><button className="button button-quiet" type="button" disabled={checkingUpdate} onClick={() => void checkUpdates()}>{checkingUpdate ? "Checking…" : "Check for updates"}</button><button className="button button-quiet" type="button" onClick={() => void downloadApiFile("/api/support-bundle/download").catch((requestError) => setError(requestError instanceof Error ? requestError.message : "Could not export diagnostics."))}>Download safe support bundle</button></div>
+            {updateStatus?.ok && <p className="settings-help">{updateStatus.update_available ? <>Version {updateStatus.latest} is available. {updateStatus.release_url && <button className="inline-link" type="button" onClick={() => void window.pywebview?.api.open_external_url(updateStatus.release_url || "")}>Open release</button>}</> : `You are up to date (${updateStatus.current}).`}</p>}
+            <p className="settings-help">Contains only build, platform, scheduler and aggregate state. Credentials, usernames, source paths and job logs are excluded.</p>
           </section>
         </div>
       </section>
@@ -956,12 +1233,12 @@ function AccountDialog({ account, connection, onClose, onFinished }: {
   const [consentNote, setConsentNote] = useState("Shared family ML workspace access");
   const [consentChecked, setConsentChecked] = useState(false);
   const [revokeText, setRevokeText] = useState("");
-  const [reconcileText, setReconcileText] = useState("");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [credentialOptions, setCredentialOptions] = useState<CredentialRefOption[]>([]);
   const [inspectingCredential, setInspectingCredential] = useState(false);
   const [credentialVerified, setCredentialVerified] = useState(false);
+  const [oauthBusy, setOauthBusy] = useState(false);
 
   const isOffline = connection !== "live";
   const controlState = account?.controlState || (account?.state === "offline" ? "disabled" : "enabled");
@@ -984,6 +1261,45 @@ function AccountDialog({ account, connection, onClose, onFinished }: {
       })
       .catch(() => undefined);
   }, [account, isOffline]);
+
+  const signInWithKaggle = async () => {
+    const api = window.pywebview?.api;
+    if (!api || oauthBusy) {
+      if (!api) setError("Kaggle browser sign-in is available only in the desktop app.");
+      return;
+    }
+    const used = new Set(credentialOptions.map((option) => option.credential_env_ref));
+    let index = 1;
+    while (used.has(`KCP_KAGGLE_MEMBER_${String(index).padStart(2, "0")}`)) index += 1;
+    const ref = `KCP_KAGGLE_MEMBER_${String(index).padStart(2, "0")}`;
+    setOauthBusy(true);
+    setError("");
+    const started = await api.start_kaggle_oauth(ref);
+    if (!started.ok) {
+      setOauthBusy(false);
+      setError(started.error || "Could not start Kaggle sign-in.");
+      return;
+    }
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      const status = await api.get_kaggle_oauth_status();
+      if (status.state === "pending") continue;
+      setOauthBusy(false);
+      if (status.state !== "succeeded") {
+        setError(status.error || "Kaggle sign-in did not complete.");
+        return;
+      }
+      setCredentialOptions((current) => [...current, { credential_env_ref: ref, available: true, registered: false }]);
+      setCredentialEnvRef(ref);
+      setUsername(status.username || "");
+      setOwnerName(status.username || "");
+      setConsentBy(status.username || "");
+      setCredentialVerified(Boolean(status.username));
+      return;
+    }
+    setOauthBusy(false);
+    setError("Kaggle sign-in timed out. You can start it again.");
+  };
 
   const inspectCredential = async () => {
     if (!credentialEnvRef.trim()) {
@@ -1083,28 +1399,6 @@ function AccountDialog({ account, connection, onClose, onFinished }: {
     }
   };
 
-  const reconcile = async () => {
-    if (!account || reconcileText !== account.username) return;
-    if (isOffline) {
-      onFinished(`API offline — @${account.username} was not reconciled.`);
-      return;
-    }
-    setSubmitting(true);
-    setError("");
-    try {
-      const data = await apiRequest(`/api/accounts/${encodeURIComponent(account.id)}/reconcile`, {
-        method: "POST",
-        body: JSON.stringify({ confirmed: true, note: "Remote Kaggle state manually checked from dashboard" }),
-      });
-      const record = data && typeof data === "object" ? data as Record<string, unknown> : {};
-      const reconciledCount = numberValue(record, ["reconciled_job_count"], 0);
-      onFinished(`@${account.username} reconciled. ${reconciledCount} local job${reconciledCount === 1 ? "" : "s"} updated.`);
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Could not reconcile this account.");
-      setSubmitting(false);
-    }
-  };
-
   const syncQuota = async () => {
     if (!account || isOffline) return;
     setSubmitting(true);
@@ -1154,9 +1448,7 @@ function AccountDialog({ account, connection, onClose, onFinished }: {
 
             {account.remoteReconciliationRequired && (
               <section className="safety-action-section safety-reconcile">
-                <div><span className="safety-kicker">REMOTE STATE UNKNOWN</span><h3>Reconcile before assigning work</h3><p>A local monitor stopped while Kaggle may still be running. Check the kernel on Kaggle first, then confirm here to unblock this account.</p></div>
-                <label><span>After checking Kaggle, type <strong>{account.username}</strong></span><input value={reconcileText} onChange={(event) => setReconcileText(event.target.value)} autoComplete="off" /></label>
-                <button className="button button-primary" disabled={submitting || reconcileText !== account.username} onClick={() => void reconcile()}>Confirm reconciliation</button>
+                <div><span className="safety-kicker">REMOTE STATUS TRACKED</span><h3>{(account.remoteActiveRuns || 0) > 0 ? "Kaggle workload still running" : "Awaiting remote status confirmation"}</h3><p>{(account.remoteActiveRuns || 0) > 0 ? "New work stays paused for this account while Kaggle has an active kernel. Control Plane checks it automatically; there is nothing to unlock manually." : "A previous local monitor ended before Kaggle confirmed the final state. Control Plane retries automatically and releases scheduling only after Kaggle reports a terminal result."}</p></div>
               </section>
             )}
 
@@ -1181,6 +1473,7 @@ function AccountDialog({ account, connection, onClose, onFinished }: {
         ) : (
           <form className="account-form" onSubmit={addAccount}>
             {isOffline && <div className="demo-form-banner"><strong>API offline</strong><span>No member can be saved until the real control plane is connected.</span></div>}
+            <div className="oauth-member-entry"><div><strong>New member</strong><span>Use Kaggle OAuth to detect the account without copying a password or API token.</span></div><button type="button" className="button button-primary" disabled={oauthBusy || isOffline} onClick={() => void signInWithKaggle()}>{oauthBusy ? "Waiting for browser…" : "Sign in with Kaggle"}</button></div>
             <div className="account-form-grid">
               <label className="wide"><span>Saved Kaggle credential</span><div className="credential-detect-row"><select value={credentialEnvRef} onChange={(event) => { setCredentialEnvRef(event.target.value); setCredentialVerified(false); }}><option value="">Select a credential</option>{credentialOptions.map((option) => <option key={option.credential_env_ref} value={option.credential_env_ref} disabled={!option.available || option.registered}>{option.credential_env_ref}{option.registered ? " (already connected)" : !option.available ? " (unavailable)" : ""}</option>)}</select><button type="button" className="button button-quiet" onClick={() => void inspectCredential()} disabled={!credentialEnvRef || inspectingCredential}>{inspectingCredential ? "Detecting…" : "Detect account"}</button></div><small>Only the saved reference is shown here; the token never enters the browser.</small></label>
               <label><span>Recommended owner name</span><input value={ownerName} onChange={(event) => setOwnerName(event.target.value)} placeholder="Detected from Kaggle" disabled={!credentialVerified} /></label>
@@ -1216,8 +1509,12 @@ function BatchComposer({ accounts, connection, onClose, onCreated }: {
     sourcePath: "",
     kernelSlug: `team-smoke-${String(index + 1).padStart(2, "0")}`,
     accelerator: "cpu",
+    machineShape: "",
   }), [assignable]);
   const [batchName, setBatchName] = useState("experiment-batch");
+  const [idempotencyKey] = useState(
+    () => `batch:${Date.now()}:${Math.random().toString(36).slice(2, 12)}`,
+  );
   const [drafts, setDrafts] = useState<DraftExperiment[]>(() => [newDraft(0)]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
@@ -1262,12 +1559,13 @@ function BatchComposer({ accounts, connection, onClose, onCreated }: {
         method: "POST",
         body: JSON.stringify({
           name: batchName.trim(),
-          jobs: drafts.map(({ name, accountId, sourcePath, kernelSlug, accelerator }) => ({
+          idempotency_key: idempotencyKey,
+          jobs: drafts.map(({ name, accountId, sourcePath, kernelSlug, accelerator, machineShape }) => ({
             account_id: accountId,
             experiment_name: name.trim(),
             source_dir: sourcePath.trim(),
             kernel_slug: kernelSlug.trim(),
-            metadata: { accelerator },
+            metadata: { accelerator, ...(machineShape ? { machine_shape: machineShape } : {}) },
           })),
         }),
       });
@@ -1304,14 +1602,14 @@ function BatchComposer({ accounts, connection, onClose, onCreated }: {
                   <label className="draft-field draft-account"><span>Owner / Kaggle account</span><select value={draft.accountId} onChange={(event) => updateDraft(draft.localId, { accountId: event.target.value })}>
                     <option value="">Select owner</option>
                     {accounts.map((account) => {
-                      const unavailable = account.state === "offline" || account.state === "blocked";
+                      const unavailable = account.state === "offline" || account.state === "blocked" || Boolean(account.remoteReconciliationRequired);
                       const reason = account.remoteReconciliationRequired
-                        ? "reconciliation required"
+                        ? account.remoteActiveRuns ? "Kaggle run active" : "checking remote status"
                         : account.state;
                       return <option key={account.id} value={account.id} disabled={unavailable}>{account.owner} · @{account.username}{unavailable ? ` (${reason})` : ""}</option>;
                     })}
                   </select><small>{owner ? `GPU ${quotaText(owner.gpuQuota)} · TPU ${quotaText(owner.tpuQuota)}` : "Assignment required"}</small></label>
-                  <label className="draft-field draft-accelerator"><span>Accelerator</span><select value={draft.accelerator} onChange={(event) => updateDraft(draft.localId, { accelerator: event.target.value })}><option value="gpu">GPU</option><option value="tpu">TPU</option><option value="cpu">CPU</option></select></label>
+                  <label className="draft-field draft-accelerator"><span>Accelerator</span><select value={draft.accelerator} onChange={(event) => { const accelerator = event.target.value; updateDraft(draft.localId, { accelerator, machineShape: accelerator === "gpu" ? "NvidiaTeslaT4" : accelerator === "tpu" ? "TpuV38" : "" }); }}><option value="gpu">GPU · Tesla T4</option><option value="tpu">TPU · V3-8</option><option value="cpu">CPU</option></select></label>
                   <button type="button" className="remove-draft" onClick={() => setDrafts((current) => current.filter((item) => item.localId !== draft.localId))} disabled={drafts.length === 1} aria-label={`Remove ${draft.name}`}>×</button>
                 </fieldset>
               );
@@ -1346,41 +1644,76 @@ function BatchComposer({ accounts, connection, onClose, onCreated }: {
   );
 }
 
-function RunDrawer({ run, connection, onClose, onAction }: {
+function RunDrawer({ run, connection, onClose, onAction, onRefresh }: {
   run: Run;
   connection: ConnectionState;
   onClose: () => void;
   onAction: (run: Run, action: "cancel" | "retry" | "result") => void;
+  onRefresh: () => void;
 }) {
-  const [logs, setLogs] = useState(run.logs);
-  const [visibleLogLines, setVisibleLogLines] = useState(100);
+  const [olderLogs, setOlderLogs] = useState<string[]>([]);
   const [beforeId, setBeforeId] = useState(run.logBeforeId);
   const [hasOlderLogs, setHasOlderLogs] = useState(run.hasOlderLogs === true);
   const [loadingOlderLogs, setLoadingOlderLogs] = useState(false);
   const [downloading, setDownloading] = useState<"logs" | "result" | null>(null);
   const [downloadError, setDownloadError] = useState("");
-  const shownLogs = logs.slice(-visibleLogLines);
+  const logs = [...olderLogs, ...run.logs];
 
   const loadOlderLogs = async () => {
     if (!beforeId || loadingOlderLogs) return;
     setLoadingOlderLogs(true);
     setDownloadError("");
     try {
-      const value = await apiRequest(`/api/jobs/${encodeURIComponent(run.id)}/events?before_id=${beforeId}&limit=200`);
+      const endpoint = run.remoteLogs ? "logs" : "events";
+      const value = await apiRequest(`/api/jobs/${encodeURIComponent(run.id)}/${endpoint}?before_id=${beforeId}&limit=200`);
       const record = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
-      const events = asList(record, ["events"]);
-      const older = events.map((event) => {
-        const item = (event && typeof event === "object" ? event : {}) as Record<string, unknown>;
-        const timestamp = textValue(item, ["created_at"], "");
-        const shortTime = timestamp.includes("T") ? timestamp.split("T")[1]?.slice(0, 8) : timestamp;
-        return `${shortTime || "--:--:--"}  ${textValue(item, ["level"], "info").toUpperCase().padEnd(7)} ${textValue(item, ["message"], "Job event")}`;
-      });
-      setLogs((current) => [...older, ...current]);
-      setVisibleLogLines((current) => current + older.length);
+      const events = asList(record, run.remoteLogs ? ["logs"] : ["events"]);
+      const older = run.remoteLogs
+        ? events.map((item) => item && typeof item === "object" ? textValue(item as Record<string, unknown>, ["line"], "") : "")
+        : events.flatMap(eventLogLines);
+      setOlderLogs((current) => [...older, ...current]);
       setBeforeId(numberValue(record, ["before_id"], 0) || undefined);
       setHasOlderLogs(record.has_more === true);
     } catch (error) {
       setDownloadError(error instanceof Error ? error.message : "Could not load older logs.");
+    } finally {
+      setLoadingOlderLogs(false);
+    }
+  };
+
+  const loadAllOlderLogs = async () => {
+    if (!beforeId || loadingOlderLogs) return;
+    setLoadingOlderLogs(true);
+    setDownloadError("");
+    try {
+      const endpoint = run.remoteLogs ? "logs" : "events";
+      let cursor = beforeId;
+      let more = hasOlderLogs;
+      const collected: string[] = [];
+
+      // The server deliberately pages logs so that opening a very noisy run is
+      // instant.  This explicit action is the opt-in path for rendering the
+      // whole stored transcript, which makes the scrollbar useful for a quick
+      // jump anywhere in the log.
+      while (cursor && more) {
+        const value = await apiRequest(
+          `/api/jobs/${encodeURIComponent(run.id)}/${endpoint}?before_id=${cursor}&limit=500`,
+        );
+        const record = (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+        const events = asList(record, run.remoteLogs ? ["logs"] : ["events"]);
+        const older = run.remoteLogs
+          ? events.map((item) => item && typeof item === "object" ? textValue(item as Record<string, unknown>, ["line"], "") : "")
+          : events.flatMap(eventLogLines);
+        if (older.length === 0) break;
+        collected.unshift(...older);
+        cursor = numberValue(record, ["before_id"], 0) || undefined;
+        more = record.has_more === true;
+      }
+      setOlderLogs((current) => [...collected, ...current]);
+      setBeforeId(cursor);
+      setHasOlderLogs(more);
+    } catch (error) {
+      setDownloadError(error instanceof Error ? error.message : "Could not load the full log.");
     } finally {
       setLoadingOlderLogs(false);
     }
@@ -1417,13 +1750,24 @@ function RunDrawer({ run, connection, onClose, onAction }: {
           <div><dt>Owner</dt><dd>{run.owner} <small>@{run.username}</small></dd></div>
           <div><dt>Accelerator</dt><dd>{run.accelerator}</dd></div>
           <div><dt>Runtime</dt><dd>{run.duration}</dd></div>
+          <div><dt>Machine shape</dt><dd>{run.machineShape || <EmptyMark />}</dd></div>
           <div><dt>Metric</dt><dd>{run.metric || <EmptyMark />}</dd></div>
+          {run.runtimeInfo && (
+            <div className="wide runtime-manifest">
+              <dt>Resolved runtime</dt>
+              <dd>
+                {Object.entries(run.runtimeInfo).map(([key, value]) => (
+                  <span key={key}><small>{key.replaceAll("_", " ")}</small><code>{value}</code></span>
+                ))}
+              </dd>
+            </div>
+          )}
           <div className="wide"><dt>Source</dt><dd><code>{run.sourcePath}</code></dd></div>
           {run.outputDir && <div className="wide"><dt>Output directory</dt><dd><code>{run.outputDir}</code></dd></div>}
           {run.resultSummary && <div className="wide"><dt>Result preview</dt><dd><ResultPreview value={run.resultSummary} /></dd></div>}
         </dl>
         <div className="drawer-progress"><div><span>Run progress</span><strong>{run.progress}%</strong></div><div role="progressbar" aria-label="Run progress" aria-valuenow={run.progress} aria-valuemin={0} aria-valuemax={100}><i style={{ width: `${run.progress}%` }} /></div></div>
-        <section className="log-panel" aria-labelledby="log-title"><header><h3 id="log-title">Live output</h3><span>Rendering {shownLogs.length} · {logs.length} loaded</span></header>{hasOlderLogs && <button type="button" className="load-more-logs load-older-logs" disabled={loadingOlderLogs} onClick={() => void loadOlderLogs()}>{loadingOlderLogs ? "Loading…" : "Load 200 older lines"}</button>}<pre>{shownLogs.map((line, index) => <code key={`${line}-${index}`}><span>{String(Math.max(1, logs.length - shownLogs.length + index + 1)).padStart(2, "0")}</span>{line}</code>)}</pre>{visibleLogLines < logs.length && <button type="button" className="load-more-logs" onClick={() => setVisibleLogLines((current) => current + 200)}>Render 200 more loaded lines</button>}</section>
+        <section className="log-panel" aria-labelledby="log-title"><header><h3 id="log-title">Live output</h3><div><span>Kaggle sync ≤30s · {logs.length} lines shown</span><button type="button" onClick={onRefresh} disabled={connection !== "live"}>Refresh</button></div></header>{hasOlderLogs && <div className="log-load-actions"><button type="button" className="load-more-logs load-older-logs" disabled={loadingOlderLogs} onClick={() => void loadOlderLogs()}>{loadingOlderLogs ? "Loading…" : "Load 500 earlier lines"}</button><button type="button" className="load-more-logs load-older-logs" disabled={loadingOlderLogs} onClick={() => void loadAllOlderLogs()}>{loadingOlderLogs ? "Loading…" : "Load all earlier lines"}</button></div>}<pre>{logs.map((line, index) => <code key={`${line}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span>{line}</code>)}</pre></section>
         {downloadError && <p className="drawer-download-error" role="alert">{downloadError}</p>}
         <footer className="drawer-actions">
           {(run.status === "running" || run.status === "queued") && <button className="button button-danger" onClick={() => onAction(run, "cancel")}>Cancel run</button>}

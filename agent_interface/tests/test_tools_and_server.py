@@ -75,10 +75,26 @@ class ToolTests(unittest.TestCase):
                 "kernel_slug": "augmentation-v1",
             },
         ]
-        self.registry.call("submit_batch", {"name": "sweep", "experiments": experiments})
+        self.registry.call(
+            "submit_batch",
+            {
+                "name": "sweep",
+                "experiments": experiments,
+                "idempotency_key": "agent-retry-0001",
+            },
+        )
         self.assertEqual(
             self.client.calls,
-            [("POST", "/api/batches", None, {"name": "sweep", "jobs": experiments})],
+            [(
+                "POST",
+                "/api/batches",
+                None,
+                {
+                    "name": "sweep",
+                    "jobs": experiments,
+                    "idempotency_key": "agent-retry-0001",
+                },
+            )],
         )
 
     def test_submit_batch_is_limited_to_ten_experiments(self):

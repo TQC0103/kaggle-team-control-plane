@@ -50,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=float(os.environ.get("KCP_POLL_SECONDS", "5")),
     )
     parser.add_argument(
+        "--live-log-poll-seconds",
+        type=float,
+        default=float(os.environ.get("KCP_LIVE_LOG_POLL_SECONDS", "30")),
+    )
+    parser.add_argument(
         "--quota-sync-seconds",
         type=float,
         default=float(os.environ.get("KCP_QUOTA_SYNC_SECONDS", "300")),
@@ -78,6 +83,7 @@ def main() -> None:
         max_workers=args.max_workers,
         max_jobs_per_account=args.max_jobs_per_account,
         remote_poll_seconds=args.poll_seconds,
+        live_log_poll_seconds=args.live_log_poll_seconds,
         quota_sync_seconds=args.quota_sync_seconds,
         quota_start_delay_seconds=args.quota_start_delay_seconds,
         max_source_bytes=args.max_source_bytes,
