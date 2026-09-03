@@ -12,6 +12,11 @@ type AccountState = "ready" | "running" | "cooldown" | "blocked" | "offline";
 type RunState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 type ConnectionState = "checking" | "live" | "partial" | "offline";
 
+type BuildInfo = {
+  version: string;
+  buildSha: string;
+};
+
 type Account = {
   id: string;
   owner: string;
@@ -110,6 +115,8 @@ type DesktopSettings = {
   credential_refs: string[];
   data_root: string;
   restart_required: boolean;
+  version?: string;
+  build_sha?: string;
 };
 
 type DesktopResult = {
@@ -121,6 +128,10 @@ type DesktopResult = {
   source_root?: string;
   restart_required?: boolean;
   username?: string;
+  current?: string;
+  latest?: string;
+  update_available?: boolean;
+  release_url?: string;
 };
 
 type DesktopApi = {
@@ -131,6 +142,8 @@ type DesktopApi = {
   forget_credential: (credentialRef: string) => Promise<DesktopResult>;
   choose_source_root: () => Promise<DesktopResult>;
   open_data_folder: () => Promise<DesktopResult>;
+  check_for_updates: () => Promise<DesktopResult>;
+  open_external_url: (url: string) => Promise<DesktopResult>;
 };
 
 declare global {
@@ -185,6 +198,18 @@ function formatDuration(seconds: number) {
   return hours > 0
     ? `${hours}h ${String(minutes).padStart(2, "0")}m`
     : `${minutes}m ${String(remainingSeconds).padStart(2, "0")}s`;
+}
+
+function downloadTextFile(filename: string, content: string, contentType: string) {
+  const blob = new Blob([content], { type: contentType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function acceleratorLabel(accelerator: string, machineShape: string) {
@@ -487,6 +512,12 @@ export default function Home() {
   const [selectedRun, setSelectedRun] = useState<Run | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [filter, setFilter] = useState<"all" | RunState>("all");
+  const [runSearch, setRunSearch] = useState("");
+  const [selectedRunIds, setSelectedRunIds] = useState<string[]>([]);
+  const [buildInfo, setBuildInfo] = useState<BuildInfo>({
+    version: "0.2.0-beta.1",
+    buildSha: "development",
+  });
 
   const refreshRunDetail = useCallback(async (runId: string, quiet = false) => {
     if (connection !== "live") return;
@@ -521,6 +552,7 @@ export default function Home() {
       apiRequest("/api/accounts"),
       apiRequest("/api/jobs?limit=500&summary=1"),
       apiRequest("/api/audit"),
+      apiRequest("/api/health"),
     ]);
 
     const fulfilled = results.filter((item) => item.status === "fulfilled").length;
@@ -552,10 +584,18 @@ export default function Home() {
       const list = asList(auditResult.value, ["audit", "events", "audit_events", "items", "data"]);
       setAuditEvents(list.map(normalizeAudit));
     }
+    const healthResult = results[3];
+    if (healthResult.status === "fulfilled" && healthResult.value && typeof healthResult.value === "object") {
+      const health = healthResult.value as Record<string, unknown>;
+      setBuildInfo({
+        version: textValue(health, ["version"], "0.2.0-beta.1"),
+        buildSha: textValue(health, ["build_sha"], "development"),
+      });
+    }
 
     if (accountResult.status === "fulfilled") setAccounts(nextAccounts);
 
-    setConnection(fulfilled === 3 ? "live" : fulfilled > 0 ? "partial" : "offline");
+    setConnection(fulfilled === 4 ? "live" : fulfilled > 0 ? "partial" : "offline");
     setRefreshing(false);
   }, [accounts]);
 
@@ -612,7 +652,63 @@ export default function Home() {
   const remainingTpuQuota = accounts.reduce((sum, item) => sum + (item.tpuQuota.remainingHours || 0), 0);
   const completedCount = runs.filter((run) => run.status === "succeeded").length;
   const scoredRun = runs.find((run) => run.metric);
-  const filteredRuns = filter === "all" ? runs : runs.filter((run) => run.status === filter);
+  const filteredRuns = runs.filter((run) => {
+    if (filter !== "all" && run.status !== filter) return false;
+    const query = runSearch.trim().toLowerCase();
+    return !query || [run.name, run.owner, run.username, run.sourcePath, run.status, run.accelerator]
+      .some((value) => value.toLowerCase().includes(query));
+  });
+
+  const exportRuns = (format: "json" | "csv") => {
+    const exported = filteredRuns.map((run) => ({
+      id: run.id,
+      experiment: run.name,
+      owner: run.owner,
+      kaggle_account: run.username,
+      status: run.status,
+      accelerator: run.accelerator,
+      source: run.sourcePath,
+      created_at: run.createdAt,
+      runtime: run.duration,
+      metric: run.metric || "",
+    }));
+    if (format === "json") {
+      downloadTextFile("kcp-runs.json", `${JSON.stringify(exported, null, 2)}\n`, "application/json");
+      return;
+    }
+    const headers = ["id", "experiment", "owner", "kaggle_account", "status", "accelerator", "source", "created_at", "runtime", "metric"] as const;
+    const escape = (value: unknown) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+    const csv = [headers.join(","), ...exported.map((row) => headers.map((key) => escape(row[key])).join(","))].join("\r\n");
+    downloadTextFile("kcp-runs.csv", `${csv}\r\n`, "text/csv;charset=utf-8");
+  };
+
+  const actionableSelection = (action: "cancel" | "retry") => selectedRunIds
+    .map((id) => runs.find((run) => run.id === id))
+    .filter((run): run is Run => Boolean(run) && (action === "cancel"
+      ? run!.status === "running" || run!.status === "queued"
+      : run!.status === "failed" || run!.status === "cancelled"))
+    .slice(0, 10);
+
+  const bulkRunAction = async (action: "cancel" | "retry") => {
+    if (connection !== "live") {
+      setToast("Control-plane API is not fully connected.");
+      return;
+    }
+    const targets = actionableSelection(action);
+    if (!targets.length) {
+      setToast(`No selected runs can be ${action === "cancel" ? "cancelled" : "retried"}.`);
+      return;
+    }
+    if (!window.confirm(`${action === "cancel" ? "Cancel" : "Retry"} ${targets.length} selected run${targets.length === 1 ? "" : "s"}?`)) return;
+    const results = await Promise.allSettled(targets.map((run) => apiRequest(
+      `/api/jobs/${encodeURIComponent(run.id)}/${action}`,
+      { method: "POST" },
+    )));
+    const succeeded = results.filter((result) => result.status === "fulfilled").length;
+    setSelectedRunIds([]);
+    setToast(`${action === "cancel" ? "Cancel" : "Retry"}: ${succeeded}/${targets.length} accepted.`);
+    await refresh(true);
+  };
 
   const connectionLabel = connection === "live"
     ? "Control plane live"
@@ -700,7 +796,7 @@ export default function Home() {
       <main id="main-content" className="main-content">
         <header className="topbar">
           <div>
-            <p className="eyebrow">Family ML workspace <span>/</span> v0.1</p>
+            <p className="eyebrow">Family ML workspace <span>/</span> v{buildInfo.version} <span>/</span> {buildInfo.buildSha.slice(0, 12)}</p>
             <h1>Experiment command center</h1>
           </div>
           <div className="topbar-actions">
@@ -725,6 +821,14 @@ export default function Home() {
             <p><strong>No sample accounts are loaded.</strong> Start the real control-plane API at <code>{API_BASE}</code>, then refresh to connect owner accounts.</p>
             <button onClick={() => void refresh()}>Try connection</button>
           </div>
+        )}
+
+        {connection === "live" && accounts.length === 0 && (
+          <section className="onboarding-panel" aria-labelledby="onboarding-title">
+            <div><p className="section-label">FIRST RUN</p><h2 id="onboarding-title">Set up your first Kaggle owner.</h2><p>Choose an experiment folder, connect an owner credential, confirm consent, then launch a CPU smoke run before using accelerator quota.</p></div>
+            <ol><li><strong>1</strong><span>Choose the managed source folder</span></li><li><strong>2</strong><span>Sign in with Kaggle or save a token</span></li><li><strong>3</strong><span>Connect the consenting owner account</span></li></ol>
+            <div>{desktopAvailable && <button className="button button-quiet" onClick={() => setDesktopSettingsOpen(true)}>App settings</button>}<button className="button button-primary" onClick={() => setAccountFormOpen(true)}>Add first member</button></div>
+          </section>
         )}
 
         <section id="overview" className="overview-section section-anchor" aria-labelledby="overview-title">
@@ -844,19 +948,20 @@ export default function Home() {
               <p className="section-label">LIVE QUEUE</p>
               <h2 id="runs-title">Experiments in motion.</h2>
             </div>
-            <div className="filter-tabs" role="group" aria-label="Filter runs">
+            <div className="run-tools"><label className="run-search"><span className="sr-only">Search runs</span><input value={runSearch} onChange={(event) => setRunSearch(event.target.value)} placeholder="Search runs…" /></label>{selectedRunIds.length > 0 && <div className="bulk-actions" aria-label="Selected run actions"><span>{selectedRunIds.length} selected</span><button type="button" onClick={() => void bulkRunAction("cancel")}>Cancel</button><button type="button" onClick={() => void bulkRunAction("retry")}>Retry</button><button type="button" onClick={() => setSelectedRunIds([])}>Clear</button></div>}<div className="export-actions"><button type="button" onClick={() => exportRuns("csv")}>CSV</button><button type="button" onClick={() => exportRuns("json")}>JSON</button></div><div className="filter-tabs" role="group" aria-label="Filter runs">
               {(["all", "running", "queued", "succeeded", "failed"] as const).map((item) => (
                 <button key={item} className={filter === item ? "active" : ""} aria-pressed={filter === item} onClick={() => setFilter(item)}>{item}</button>
               ))}
-            </div>
+            </div></div>
           </div>
 
           <div className="run-table-wrap">
             <table className="run-table">
-              <thead><tr><th scope="col">Experiment</th><th scope="col">Owner / account</th><th scope="col">Status</th><th scope="col">Progress</th><th scope="col">Runtime</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
+              <thead><tr><th scope="col" className="select-column"><input type="checkbox" aria-label="Select all visible runs" checked={filteredRuns.length > 0 && filteredRuns.every((run) => selectedRunIds.includes(run.id))} onChange={(event) => setSelectedRunIds((current) => event.target.checked ? Array.from(new Set([...current, ...filteredRuns.map((run) => run.id)])) : current.filter((id) => !filteredRuns.some((run) => run.id === id)))} /></th><th scope="col">Experiment</th><th scope="col">Owner / account</th><th scope="col">Status</th><th scope="col">Progress</th><th scope="col">Runtime</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
               <tbody>
                 {filteredRuns.map((run) => (
                   <tr key={run.id}>
+                    <td className="select-column"><input type="checkbox" aria-label={`Select ${run.name}`} checked={selectedRunIds.includes(run.id)} onChange={(event) => setSelectedRunIds((current) => event.target.checked ? [...current, run.id] : current.filter((id) => id !== run.id))} /></td>
                     <td><button className="run-name" onClick={() => void openRun(run)}><strong>{run.name}</strong><span>{run.sourcePath}</span></button></td>
                     <td><div className="run-owner"><span>{run.owner.slice(0, 1)}</span><div><strong>{run.owner}</strong><small>@{run.username}</small></div></div></td>
                     <td><StatusBadge status={run.status} /></td>
@@ -867,7 +972,7 @@ export default function Home() {
                     <td><button className="row-action" onClick={() => void openRun(run)} aria-label={`Open ${run.name} details`}>Open <span>↗</span></button></td>
                   </tr>
                 ))}
-                {!filteredRuns.length && <tr><td colSpan={6} className="empty-state">No runs match this filter.</td></tr>}
+                {!filteredRuns.length && <tr><td colSpan={7} className="empty-state">No runs match this filter.</td></tr>}
               </tbody>
             </table>
           </div>
@@ -904,7 +1009,7 @@ export default function Home() {
           </div>
         </section>
 
-        <footer className="page-footer"><p>Kaggle Team Control Plane <span>·</span> MVP round 01</p><p>Credentials stay behind the local control plane.</p></footer>
+        <footer className="page-footer"><p>Kaggle Team Control Plane <span>·</span> v{buildInfo.version} <span>·</span> {buildInfo.buildSha.slice(0, 12)}</p><p>Credentials stay behind the local control plane.</p></footer>
       </main>
 
       {composerOpen && (
@@ -969,6 +1074,8 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [oauthBusy, setOauthBusy] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState<DesktopResult | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [error, setError] = useState("");
 
   const reload = useCallback(async () => {
@@ -1056,6 +1163,17 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
     onChanged("Source folder saved. Restart the app once to activate it.");
   };
 
+  const checkUpdates = async () => {
+    const api = window.pywebview?.api;
+    if (!api || checkingUpdate) return;
+    setCheckingUpdate(true);
+    setError("");
+    const result = await api.check_for_updates();
+    setCheckingUpdate(false);
+    setUpdateStatus(result);
+    if (!result.ok) setError(result.error || "Could not check for updates.");
+  };
+
   return (
     <div className="modal-layer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
       <section className="account-dialog desktop-settings" role="dialog" aria-modal="true" aria-labelledby="desktop-settings-title">
@@ -1088,6 +1206,13 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
             <code className="settings-path">{settings?.source_root || "Loading…"}</code>
             <div className="settings-actions"><button className="button button-quiet" type="button" onClick={() => void chooseSource()}>Browse folder</button><button className="button button-quiet" type="button" onClick={() => void window.pywebview?.api.open_data_folder()}>Open app data</button></div>
             {settings?.restart_required && <p className="restart-note">Restart the app to activate the new source folder. Token changes are already active.</p>}
+          </section>
+          <section className="settings-section">
+            <div><p className="section-label">SUPPORT</p><h3>Diagnostics and build</h3></div>
+            <p className="settings-version">Version <strong>{settings?.version || "0.2.0-beta.1"}</strong> · build <code>{settings?.build_sha || "development"}</code></p>
+            <div className="settings-actions"><button className="button button-quiet" type="button" disabled={checkingUpdate} onClick={() => void checkUpdates()}>{checkingUpdate ? "Checking…" : "Check for updates"}</button><button className="button button-quiet" type="button" onClick={() => void downloadApiFile("/api/support-bundle/download").catch((requestError) => setError(requestError instanceof Error ? requestError.message : "Could not export diagnostics."))}>Download safe support bundle</button></div>
+            {updateStatus?.ok && <p className="settings-help">{updateStatus.update_available ? <>Version {updateStatus.latest} is available. {updateStatus.release_url && <button className="inline-link" type="button" onClick={() => void window.pywebview?.api.open_external_url(updateStatus.release_url || "")}>Open release</button>}</> : `You are up to date (${updateStatus.current}).`}</p>}
+            <p className="settings-help">Contains only build, platform, scheduler and aggregate state. Credentials, usernames, source paths and job logs are excluded.</p>
           </section>
         </div>
       </section>
@@ -1387,6 +1512,9 @@ function BatchComposer({ accounts, connection, onClose, onCreated }: {
     machineShape: "",
   }), [assignable]);
   const [batchName, setBatchName] = useState("experiment-batch");
+  const [idempotencyKey] = useState(
+    () => `batch:${Date.now()}:${Math.random().toString(36).slice(2, 12)}`,
+  );
   const [drafts, setDrafts] = useState<DraftExperiment[]>(() => [newDraft(0)]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
@@ -1431,6 +1559,7 @@ function BatchComposer({ accounts, connection, onClose, onCreated }: {
         method: "POST",
         body: JSON.stringify({
           name: batchName.trim(),
+          idempotency_key: idempotencyKey,
           jobs: drafts.map(({ name, accountId, sourcePath, kernelSlug, accelerator, machineShape }) => ({
             account_id: accountId,
             experiment_name: name.trim(),

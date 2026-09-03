@@ -21,7 +21,7 @@ def test_initialize_and_tools() -> None:
     assert initialized["result"]["serverInfo"]["name"] == "kaggle-control-plane"
     listed = SERVER._handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     names = {tool["name"] for tool in listed["result"]["tools"]}
-    assert {"kcp_status", "kcp_submit_batch", "kcp_download_artifact"} <= names
+    assert {"kcp_status", "kcp_submit_batch", "kcp_download_artifact", "kcp_download_support_bundle"} <= names
 
 
 def test_redaction() -> None:
@@ -31,11 +31,32 @@ def test_redaction() -> None:
 
 def test_status_summary() -> None:
     responses = [
+        ({"version": "0.2.0-beta.1", "build_sha": "abc123"}, {}),
         ({"accounts": [{"id": "a"}]}, {}),
         ({"states": {"succeeded": 1, "failed": 1}}, {}),
     ]
     with mock.patch.object(SERVER, "_request", side_effect=responses):
-        assert SERVER._call("kcp_status", {})["job_states"] == {"succeeded": 1, "failed": 1}
+        status = SERVER._call("kcp_status", {})
+        assert status["job_states"] == {"succeeded": 1, "failed": 1}
+        assert status["version"] == "0.2.0-beta.1"
+
+
+def test_submit_forwards_idempotency_key(tmp_path: Path) -> None:
+    (tmp_path / "kernel-metadata.json").write_text("{}\n", encoding="utf-8")
+    arguments = {
+        "batch_name": "evaluation",
+        "idempotency_key": "agent-retry-0001",
+        "jobs": [{
+            "account_id": "a",
+            "experiment_name": "eval",
+            "source_dir": str(tmp_path),
+            "kernel_slug": "eval",
+            "accelerator": "cpu",
+        }],
+    }
+    with mock.patch.object(SERVER, "_request", return_value=({"batch": {"id": "b"}}, {})) as request:
+        SERVER._call("kcp_submit_batch", arguments)
+    assert request.call_args.args[2]["idempotency_key"] == "agent-retry-0001"
 
 
 def test_list_jobs_uses_server_side_bounds_and_filters() -> None:

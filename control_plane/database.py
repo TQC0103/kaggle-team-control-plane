@@ -80,6 +80,8 @@ class Database:
                 CREATE TABLE IF NOT EXISTS batches (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    request_hash TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -117,6 +119,8 @@ class Database:
                 CREATE INDEX IF NOT EXISTS jobs_account_status_idx
                     ON jobs(account_id, status);
                 CREATE INDEX IF NOT EXISTS jobs_batch_idx ON jobs(batch_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS batches_idempotency_idx
+                    ON batches(idempotency_key) WHERE idempotency_key IS NOT NULL;
 
                 CREATE TABLE IF NOT EXISTS job_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,6 +178,18 @@ class Database:
                 )
             if "remote_started_at" not in job_columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN remote_started_at TEXT")
+            batch_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(batches)").fetchall()
+            }
+            if "idempotency_key" not in batch_columns:
+                connection.execute("ALTER TABLE batches ADD COLUMN idempotency_key TEXT")
+            if "request_hash" not in batch_columns:
+                connection.execute("ALTER TABLE batches ADD COLUMN request_hash TEXT")
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS batches_idempotency_idx "
+                "ON batches(idempotency_key) WHERE idempotency_key IS NOT NULL"
+            )
             account_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(accounts)").fetchall()
@@ -649,16 +665,31 @@ class Database:
         job_specs: list[dict[str, Any]],
         actor: str,
         default_output_root: Path,
+        *,
+        idempotency_key: str | None = None,
+        request_hash: str | None = None,
     ) -> dict[str, Any]:
         batch_id = new_id("batch")
         now = utc_now()
         jobs: list[dict[str, Any]] = []
         with self.connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if idempotency_key:
+                existing = connection.execute(
+                    "SELECT id,request_hash FROM batches WHERE idempotency_key=?",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing:
+                    if existing["request_hash"] != request_hash:
+                        raise ConflictError(
+                            "idempotency_key was already used for a different batch request"
+                        )
+                    return self.get_batch(existing["id"], include_jobs=True)
             connection.execute(
-                "INSERT INTO batches (id,name,created_by,created_at,updated_at) "
-                "VALUES (?,?,?,?,?)",
-                (batch_id, name, actor, now, now),
+                "INSERT INTO batches "
+                "(id,name,idempotency_key,request_hash,created_by,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (batch_id, name, idempotency_key, request_hash, actor, now, now),
             )
             for spec in job_specs:
                 job_id = new_id("job")

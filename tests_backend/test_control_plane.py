@@ -427,6 +427,73 @@ class StorageAndCredentialsTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_batch_submission_is_idempotent_and_detects_key_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = ControlPlaneService(
+                root / "state.sqlite3",
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=FakeKaggleAdapter(),
+                vault=EnvCredentialVault({"IDEMPOTENT_ACCOUNT": "token"}),
+                start_scheduler=False,
+            )
+            try:
+                account = service.create_account(
+                    account_payload("idempotent-user", "IDEMPOTENT_ACCOUNT"), "tester"
+                )
+                payload = {
+                    "name": "idempotent batch",
+                    "idempotency_key": "submit:client-request-001",
+                    "jobs": [{
+                        "account_id": account["id"],
+                        "experiment_name": "idempotent experiment",
+                        "source_dir": str(make_source(root, "idempotent-source")),
+                        "kernel_slug": "idempotent-experiment",
+                    }],
+                }
+                first = service.create_batch(payload, "tester")
+                replay = service.create_batch(payload, "tester")
+                self.assertEqual(replay["id"], first["id"])
+                self.assertEqual(replay["jobs"][0]["id"], first["jobs"][0]["id"])
+                changed = dict(payload)
+                changed["name"] = "different request"
+                with self.assertRaises(ConflictError):
+                    service.create_batch(changed, "tester")
+            finally:
+                service.close()
+
+    def test_support_bundle_is_allow_listed_and_contains_build_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            secret = "must-never-appear-in-support-bundle"
+            service = ControlPlaneService(
+                root / "state.sqlite3",
+                data_dir=root / "data",
+                allowed_source_root=root,
+                adapter=FakeKaggleAdapter(),
+                vault=EnvCredentialVault({"SUPPORT_ACCOUNT": secret}),
+                start_scheduler=False,
+            )
+            try:
+                service.create_account(
+                    account_payload("private-username", "SUPPORT_ACCOUNT"), "tester"
+                )
+                filename, bundle = service.support_bundle_download()
+                self.assertEqual(filename, "kcp-support-bundle.zip")
+                with zipfile.ZipFile(bundle) as archive:
+                    self.assertEqual(archive.namelist(), ["support.json"])
+                    raw = archive.read("support.json").decode("utf-8")
+                    payload = json.loads(raw)
+                self.assertIn("version", payload)
+                self.assertIn("build_sha", payload)
+                self.assertEqual(payload["account_summary"]["total"], 1)
+                self.assertNotIn(secret, raw)
+                self.assertNotIn("private-username", raw)
+                self.assertNotIn("SUPPORT_ACCOUNT", raw)
+            finally:
+                service.close()
+
     def test_reaffirming_submitted_does_not_reset_remote_runtime_clock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1784,6 +1851,8 @@ class ApiTests(unittest.TestCase):
                 status, health, headers = request("GET", "/api/health", authenticated=False)
                 self.assertEqual(status, 200)
                 self.assertEqual(health["status"], "ok")
+                self.assertIn("version", health)
+                self.assertIn("build_sha", health)
                 self.assertEqual(headers["Access-Control-Allow-Origin"], "http://localhost:3000")
                 status, _, _ = request("GET", "/api/accounts", authenticated=False)
                 self.assertEqual(status, 401)

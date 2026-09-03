@@ -73,3 +73,8 @@ Run proportional local checks before packaging: desktop/backend tests, frontend
 lint/build test, compile check, and `git diff --check`. Inspect PyInstaller
 warnings for Kaggle SDK imports and record the installed executable hash. Batch
 related fixes and package once instead of rebuilding after each edit.
+
+Release-candidate builds must embed the requested SemVer and commit SHA. Keep
+GitHub prerelease publication opt-in. If Authenticode certificate secrets are
+absent, identify the artifact as unsigned; never simulate a signature. Generate
+or refresh the SHA-256 sidecar after the final signing step.

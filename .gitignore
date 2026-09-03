@@ -41,6 +41,7 @@ yarn-error.log*
 /release/
 /build/desktop/
 /build/desktop-cli/
+/control_plane/_build.py
 
 # generated Kaggle workload bundles (source snapshots, datasets, and revisions)
 /experiments/*/

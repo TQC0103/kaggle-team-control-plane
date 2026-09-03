@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -19,6 +20,7 @@ from typing import Any
 
 from control_plane.api import create_server
 from control_plane.service import ControlPlaneService
+from control_plane.version import build_identity
 
 from .credential_store import WindowsCredentialStore
 from .oauth import (
@@ -30,6 +32,64 @@ from .oauth import (
 
 
 APP_NAME = "Kaggle Control Plane"
+RELEASES_API = "https://api.github.com/repos/TQC0103/kaggle-team-control-plane/releases?per_page=10"
+
+
+def _semver_key(value: str) -> tuple[int, int, int, tuple[int, str]] | None:
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?", value.strip())
+    if not match:
+        return None
+    prerelease = match.group(4)
+    # A stable build sorts after its prereleases. Numeric prerelease suffixes
+    # are compared numerically for beta.2 -> beta.10 behavior.
+    if prerelease is None:
+        release_key = (1, "")
+    else:
+        normalized = re.sub(
+            r"\d+", lambda item: f"{int(item.group()):010d}", prerelease.lower()
+        )
+        release_key = (0, normalized)
+    return int(match.group(1)), int(match.group(2)), int(match.group(3)), release_key
+
+
+def update_available(current: str, latest: str) -> bool:
+    current_key = _semver_key(current)
+    latest_key = _semver_key(latest)
+    return bool(current_key and latest_key and latest_key > current_key)
+
+
+def fetch_update_status(timeout: float = 4.0) -> dict[str, Any]:
+    identity = build_identity()
+    current = str(identity["version"])
+    request = urllib.request.Request(
+        RELEASES_API,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "KaggleControlPlane"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.load(response)
+        releases = payload if isinstance(payload, list) else []
+        candidates: list[tuple[tuple[int, int, int, tuple[int, str]], dict[str, Any]]] = []
+        for release in releases:
+            if not isinstance(release, dict) or release.get("draft") is True:
+                continue
+            tag = str(release.get("tag_name") or "")
+            key = _semver_key(tag)
+            if key:
+                candidates.append((key, release))
+        if not candidates:
+            return {"ok": True, "current": current, "latest": current, "update_available": False}
+        _, latest_release = max(candidates, key=lambda item: item[0])
+        latest = str(latest_release.get("tag_name") or "").lstrip("v")
+        return {
+            "ok": True,
+            "current": current,
+            "latest": latest,
+            "update_available": update_available(current, latest),
+            "release_url": str(latest_release.get("html_url") or ""),
+        }
+    except Exception as exc:
+        return {"ok": False, "current": current, "error": f"Update check failed: {exc}"}
 
 
 def resource_root() -> Path:
@@ -101,6 +161,7 @@ class DesktopBridge:
     def get_settings(self) -> dict[str, Any]:
         return {
             "desktop": True,
+            **build_identity(),
             "source_root": str(self._runtime.source_root),
             "credential_refs": self._runtime.credential_store.list_refs(),
             "data_root": str(self._runtime.data_root),
@@ -150,6 +211,20 @@ class DesktopBridge:
     def open_data_folder(self) -> dict[str, Any]:
         try:
             os.startfile(self._runtime.data_root)  # type: ignore[attr-defined]
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def check_for_updates(self) -> dict[str, Any]:
+        return fetch_update_status()
+
+    def open_external_url(self, url: str) -> dict[str, Any]:
+        try:
+            if not isinstance(url, str) or not url.startswith(
+                "https://github.com/TQC0103/kaggle-team-control-plane/releases/"
+            ):
+                raise ValueError("Only the official KCP releases page can be opened")
+            os.startfile(url)  # type: ignore[attr-defined]
             return {"ok": True}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}

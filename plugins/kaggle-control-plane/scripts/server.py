@@ -75,6 +75,13 @@ TOOLS = [
         "inputSchema": _schema(
             {
                 "batch_name": {"type": "string", "minLength": 1, "maxLength": 120},
+                "idempotency_key": {
+                    "type": "string",
+                    "minLength": 8,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9._:-]+$",
+                    "description": "Reuse the same key when retrying the same batch request after an uncertain response.",
+                },
                 "jobs": {
                     "type": "array",
                     "minItems": 1,
@@ -132,6 +139,14 @@ TOOLS = [
                 "destination_dir": {"type": "string", "minLength": 1},
             },
             ["job_id", "artifact", "destination_dir"],
+        ),
+    },
+    {
+        "name": "kcp_download_support_bundle",
+        "description": "Download an allow-listed diagnostic ZIP with aggregate state only; credentials, usernames, paths, logs, and artifacts are excluded.",
+        "inputSchema": _schema(
+            {"destination_dir": {"type": "string", "minLength": 1}},
+            ["destination_dir"],
         ),
     },
 ]
@@ -254,11 +269,19 @@ def _call(name: str, arguments: dict[str, Any]) -> Any:
         jobs = _items(payload, "jobs", "runs", "items", "data")
         return _safe(jobs)
     if name == "kcp_status":
+        health, _ = _request("/api/health")
         accounts_payload, _ = _request("/api/accounts")
         stats_payload, _ = _request("/api/jobs/stats")
         accounts = _items(accounts_payload, "accounts", "items", "data")
         states = stats_payload.get("states", {}) if isinstance(stats_payload, dict) else {}
-        return {"online": True, "base_url": BASE_URL, "account_count": len(accounts), "job_states": states}
+        return {
+            "online": True,
+            "base_url": BASE_URL,
+            "version": health.get("version") if isinstance(health, dict) else None,
+            "build_sha": health.get("build_sha") if isinstance(health, dict) else None,
+            "account_count": len(accounts),
+            "job_states": states,
+        }
     if name == "kcp_get_job":
         job_id = urllib.parse.quote(arguments["job_id"], safe="")
         query = urllib.parse.urlencode(
@@ -268,7 +291,10 @@ def _call(name: str, arguments: dict[str, Any]) -> Any:
         return _safe(payload)
     if name == "kcp_submit_batch":
         jobs = [_source_job(job) for job in arguments["jobs"]]
-        payload, _ = _request("/api/batches", "POST", {"name": arguments["batch_name"], "jobs": jobs}, timeout=30)
+        body = {"name": arguments["batch_name"], "jobs": jobs}
+        if arguments.get("idempotency_key"):
+            body["idempotency_key"] = arguments["idempotency_key"]
+        payload, _ = _request("/api/batches", "POST", body, timeout=30)
         return _safe(payload)
     if name == "kcp_job_action":
         job_id = urllib.parse.quote(arguments["job_id"], safe="")
@@ -291,6 +317,12 @@ def _call(name: str, arguments: dict[str, Any]) -> Any:
             f"/api/jobs/{job_id}/{artifact}/download",
             arguments["destination_dir"],
             f"{arguments['job_id']}-{artifact}.{suffix}",
+        )
+    if name == "kcp_download_support_bundle":
+        return _download(
+            "/api/support-bundle/download",
+            arguments["destination_dir"],
+            "kcp-support-bundle.zip",
         )
     raise ValueError(f"Unknown tool: {name}")
 

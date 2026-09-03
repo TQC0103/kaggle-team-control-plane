@@ -108,6 +108,13 @@ add, replace, or forget encrypted Kaggle tokens and select the experiment source
 folder. Account/token/database changes are runtime data and never require a
 frontend or EXE rebuild. Only code updates require rebuilding the app.
 
+The dashboard includes first-run onboarding, run search, filtered CSV/JSON
+exports, and confirmed bulk cancel/retry actions (capped at 10 runs per action).
+Batch creation carries an idempotency key, so a browser retry cannot enqueue a
+duplicate batch. **App settings** shows the embedded version/build, checks the
+official GitHub releases feed on demand, and exports an allow-listed support
+bundle containing aggregate diagnostics only.
+
 To onboard a member without copying an API token, choose **Add member**, click
 **Sign in with Kaggle**, and finish authentication in the browser. After Kaggle
 returns to Control Plane, verify the detected owner, record explicit consent,
@@ -126,8 +133,8 @@ when needed, so the first installation requires an internet connection.
 Their DPAPI tokens, accounts, jobs, source folder, and results are created under
 their own Windows profile and are never copied from the machine that built it.
 
-This early-beta installer is not code-signed yet, so Windows SmartScreen may
-show an **Unknown publisher** warning. Share the generated
+Local early-beta builds are unsigned unless a signing certificate is supplied,
+so Windows SmartScreen may show an **Unknown publisher** warning. Share the generated
 `KaggleControlPlane-Setup.exe.sha256` file alongside the installer and have the
 tester verify it before running Setup:
 
@@ -139,6 +146,23 @@ Get-Content .\KaggleControlPlane-Setup.exe.sha256
 The two hashes must match exactly. Only accept an installer and checksum from a
 project-owner-controlled channel; do not bypass a warning for an unexpected or
 mismatched file.
+
+### Release candidates
+
+The manually dispatched **Release candidate** GitHub Actions workflow runs the
+complete test suite on Windows, embeds the requested SemVer and commit SHA,
+builds the installer, and uploads the installer plus SHA-256 checksum as a
+14-day Actions artifact. Publishing a GitHub prerelease is an explicit workflow
+input and defaults to off.
+
+Authenticode signing is automatic when these repository secrets are configured:
+
+- `WINDOWS_SIGNING_CERTIFICATE_BASE64`: base64-encoded code-signing PFX
+- `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`: PFX password
+
+Without both secrets, the workflow clearly produces an unsigned candidate. It
+never fabricates a signature. The checksum is regenerated after installer
+signing so it always describes the distributed bytes.
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass

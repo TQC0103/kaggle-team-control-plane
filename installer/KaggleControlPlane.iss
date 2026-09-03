@@ -1,5 +1,7 @@
 #define MyAppName "Kaggle Control Plane"
-#define MyAppVersion "0.2.0"
+#ifndef MyAppVersion
+  #define MyAppVersion "0.2.0-beta.1"
+#endif
 #define MyAppPublisher "Kaggle Control Plane Team"
 #define MyAppExeName "KaggleControlPlane.exe"
 

@@ -41,7 +41,9 @@ Do not load both references unless the task genuinely spans both modes.
    use `TpuV38`; omit shape for CPU.
 5. Require clear authorization immediately before submit, cancel, or retry.
    Prior authorization in the active request is sufficient. Keep runs bounded:
-   at most ten jobs per batch and two concurrent jobs per account.
+   at most ten jobs per batch and two concurrent jobs per account. Supply an
+   `idempotency_key` and reuse it only when retrying the exact same batch after
+   an uncertain response; a changed request requires a new key.
 6. Poll with `kcp_list_jobs` or `kcp_get_job` at bounded intervals. Treat
    normalized `accelerator`, `machine_shape`, `elapsed_seconds`, and optional
    `runtime` as authoritative.
@@ -49,6 +51,10 @@ Do not load both references unless the task genuinely spans both modes.
    ignored by Git.
 8. Report account ID, shape, source directory, kernel slug, job ID, final state,
    and artifact location. Omit usernames unless requested.
+
+When troubleshooting needs a handoff, prefer `kcp_download_support_bundle` to
+manual log/database collection. It contains allow-listed aggregate diagnostics
+and build identity, never credentials, usernames, paths, job logs, or artifacts.
 
 Use the laptop for unit tests, formatting, schema validation, dataset parsing,
 and short smoke checks only. Use Control Plane for embeddings, batch model

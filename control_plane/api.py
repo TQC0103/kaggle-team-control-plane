@@ -104,6 +104,14 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             self.log_error("unhandled request error: %s", exc)
 
     def _download(self, path: str) -> bool:
+        if path == "/api/support-bundle/download":
+            filename, file_path = self.server.service.support_bundle_download()
+            self._send_download_headers(
+                filename, "application/zip", file_path.stat().st_size
+            )
+            with file_path.open("rb") as source:
+                shutil.copyfileobj(source, self.wfile, length=1024 * 1024)
+            return True
         logs = re.fullmatch(r"/api/jobs/([^/]+)/logs/download", path)
         if logs:
             filename, file_path = self.server.service.job_logs_download(logs.group(1))

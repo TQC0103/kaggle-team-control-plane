@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -27,6 +29,7 @@ from .credentials import EnvCredentialVault, validate_env_ref
 from .database import Database
 from .errors import ConflictError, ValidationError
 from .scheduler import JobScheduler
+from .version import build_identity
 
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$")
@@ -172,6 +175,7 @@ class ControlPlaneService:
     def health(self) -> dict[str, Any]:
         return {
             "status": "ok",
+            **build_identity(),
             "database": "ok",
             "adapter": self.adapter.__class__.__name__,
             "scheduler": self.scheduler.snapshot(),
@@ -745,6 +749,14 @@ class ControlPlaneService:
 
     def create_batch(self, payload: dict[str, Any], actor: str) -> dict[str, Any]:
         name = _required_text(payload, "name", 300)
+        idempotency_key = payload.get("idempotency_key")
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not re.fullmatch(
+                r"[A-Za-z0-9._:-]{8,128}", idempotency_key
+            ):
+                raise ValidationError(
+                    "idempotency_key must be 8-128 URL-safe characters"
+                )
         raw_jobs = payload.get("jobs")
         if not isinstance(raw_jobs, list) or not raw_jobs:
             raise ValidationError("jobs must be a non-empty list")
@@ -832,9 +844,50 @@ class ControlPlaneService:
                     "metadata": metadata,
                 }
             )
-        batch = self.database.create_batch(name, specs, actor, self.artifact_root)
+        canonical_request = json.dumps(
+            {"name": name, "jobs": specs}, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        request_hash = hashlib.sha256(canonical_request).hexdigest()
+        batch = self.database.create_batch(
+            name,
+            specs,
+            actor,
+            self.artifact_root,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash if idempotency_key else None,
+        )
         self.scheduler.wake()
         return self._decorate_batch(batch)
+
+    def support_bundle_download(self) -> tuple[str, Path]:
+        """Create an allow-listed diagnostic archive with no credential material."""
+        downloads = (self.data_dir / "downloads").resolve()
+        downloads.mkdir(parents=True, exist_ok=True)
+        archive_path = downloads / "kcp-support-bundle.zip"
+        temporary_path = archive_path.with_suffix(".zip.tmp")
+        accounts = self.list_accounts()
+        payload = {
+            **build_identity(),
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "platform": {
+                "system": platform.system(),
+                "release": platform.release(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+            },
+            "health": self.health(),
+            "job_state_counts": self.job_state_counts(),
+            "account_summary": {
+                "total": len(accounts),
+                "enabled": sum(1 for account in accounts if account["state"] == "enabled"),
+            },
+        }
+        with zipfile.ZipFile(temporary_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "support.json", json.dumps(payload, indent=2, sort_keys=True) + "\n"
+            )
+        temporary_path.replace(archive_path)
+        return archive_path.name, archive_path
 
     def list_batches(self) -> list[dict[str, Any]]:
         return [self._decorate_batch(batch) for batch in self.database.list_batches()]
