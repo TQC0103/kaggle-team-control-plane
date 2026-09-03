@@ -27,5 +27,10 @@ if (-not $compiler) {
 if ($LASTEXITCODE -ne 0) { throw 'Setup compiler failed.' }
 
 $setup = Join-Path $projectRoot 'release\installer\KaggleControlPlane-Setup.exe'
+$checksum = "$setup.sha256"
+$setupHash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash
+Set-Content -LiteralPath $checksum -Value "$setupHash  KaggleControlPlane-Setup.exe" -Encoding ASCII
 Write-Host ''
 Write-Host "Single-file installer ready: $setup"
+Write-Host "SHA-256: $setupHash"
+Write-Host "Checksum file: $checksum"

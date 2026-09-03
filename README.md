@@ -126,6 +126,20 @@ when needed, so the first installation requires an internet connection.
 Their DPAPI tokens, accounts, jobs, source folder, and results are created under
 their own Windows profile and are never copied from the machine that built it.
 
+This early-beta installer is not code-signed yet, so Windows SmartScreen may
+show an **Unknown publisher** warning. Share the generated
+`KaggleControlPlane-Setup.exe.sha256` file alongside the installer and have the
+tester verify it before running Setup:
+
+```powershell
+(Get-FileHash .\KaggleControlPlane-Setup.exe -Algorithm SHA256).Hash
+Get-Content .\KaggleControlPlane-Setup.exe.sha256
+```
+
+The two hashes must match exactly. Only accept an installer and checksum from a
+project-owner-controlled channel; do not bypass a warning for an unexpected or
+mismatched file.
+
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 
