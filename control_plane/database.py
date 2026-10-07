@@ -119,9 +119,6 @@ class Database:
                 CREATE INDEX IF NOT EXISTS jobs_account_status_idx
                     ON jobs(account_id, status);
                 CREATE INDEX IF NOT EXISTS jobs_batch_idx ON jobs(batch_id);
-                CREATE UNIQUE INDEX IF NOT EXISTS batches_idempotency_idx
-                    ON batches(idempotency_key) WHERE idempotency_key IS NOT NULL;
-
                 CREATE TABLE IF NOT EXISTS job_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     event_id TEXT NOT NULL UNIQUE,

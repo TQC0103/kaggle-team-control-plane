@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .errors import ControlPlaneError, NotFoundError, ValidationError
 from .service import ControlPlaneService
+from .dataset_transfer import publish_private_checkpoint, check_private_checkpoint_access, private_checkpoint_status
 
 
 LOCAL_ORIGIN = re.compile(r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?$")
@@ -201,6 +202,23 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             return 200, service.health()
         if method == "GET" and path == "/api/accounts":
             return 200, {"accounts": service.list_accounts()}
+        if method == "GET" and path == "/api/datasets/operations":
+            return 200, {"operations": service.datasets.list_operations()}
+        dataset_operation = re.fullmatch(r"/api/datasets/operations/([a-f0-9]{32})", path)
+        if method == "GET" and dataset_operation:
+            return 200, {"operation": service.datasets.get_operation(dataset_operation.group(1))}
+        if method == "POST" and path == "/api/datasets/prepare":
+            return 200, service.datasets.prepare(body)
+        if method == "POST" and path == "/api/datasets/inspect":
+            return 200, service.datasets.inspect(body)
+        if method == "POST" and path == "/api/datasets/operations":
+            return 202, {"operation": service.datasets.submit(body, actor)}
+        if method == "POST" and path == "/api/datasets/private-checkpoint/publish":
+            return 200, publish_private_checkpoint(service, body, actor)
+        if method == "POST" and path == "/api/datasets/private-checkpoint/access":
+            return 200, check_private_checkpoint_access(service, body, actor)
+        if method == "POST" and path == "/api/datasets/private-checkpoint/status":
+            return 200, private_checkpoint_status(service, body, actor)
         if method == "POST" and path == "/api/credentials/inspect":
             return 200, service.inspect_credential(body)
         if method == "GET" and path == "/api/credentials":

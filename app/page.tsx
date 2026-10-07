@@ -1,5 +1,7 @@
 "use client";
 
+import DatasetsPanel from "./datasets-panel";
+
 import {
   FormEvent,
   useCallback,
@@ -141,6 +143,7 @@ type DesktopApi = {
   get_kaggle_oauth_status: () => Promise<DesktopResult>;
   forget_credential: (credentialRef: string) => Promise<DesktopResult>;
   choose_source_root: () => Promise<DesktopResult>;
+  choose_dataset_files: (folder: boolean) => Promise<DesktopResult & { selection_id?: string; file_count?: number; bytes?: number; files?: { name: string; bytes: number }[] }>;
   open_data_folder: () => Promise<DesktopResult>;
   check_for_updates: () => Promise<DesktopResult>;
   open_external_url: (url: string) => Promise<DesktopResult>;
@@ -777,8 +780,9 @@ export default function Home() {
         <nav className="side-nav">
           <button className="nav-item active" onClick={() => scrollTo("overview")}><span>01</span>Overview</button>
           <button className="nav-item" onClick={() => scrollTo("accounts")}><span>02</span>Accounts</button>
-          <button className="nav-item" onClick={() => scrollTo("runs")}><span>03</span>Runs</button>
-          <button className="nav-item" onClick={() => scrollTo("audit")}><span>04</span>Audit</button>
+          <button className="nav-item" onClick={() => scrollTo("datasets")}><span>03</span>Datasets</button>
+          <button className="nav-item" onClick={() => scrollTo("runs")}><span>04</span>Runs</button>
+          <button className="nav-item" onClick={() => scrollTo("audit")}><span>05</span>Audit</button>
         </nav>
 
         <div className="sidebar-bottom">
@@ -941,6 +945,8 @@ export default function Home() {
             })}
           </div>
         </section>
+
+        <DatasetsPanel accounts={accounts} desktopAvailable={desktopAvailable} request={apiRequest} />
 
         <section id="runs" className="section-block section-anchor" aria-labelledby="runs-title">
           <div className="section-heading run-heading">
@@ -1687,7 +1693,7 @@ function RunDrawer({ run, connection, onClose, onAction, onRefresh }: {
     setDownloadError("");
     try {
       const endpoint = run.remoteLogs ? "logs" : "events";
-      let cursor = beforeId;
+      let cursor: number | undefined = beforeId;
       let more = hasOlderLogs;
       const collected: string[] = [];
 

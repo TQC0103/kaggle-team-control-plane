@@ -20,9 +20,12 @@ from typing import Any
 
 from control_plane.api import create_server
 from control_plane.service import ControlPlaneService
+from control_plane.credentials import EnvCredentialVault
+from control_plane.adapters import KaggleCliAdapter
 from control_plane.version import build_identity
 
 from .credential_store import WindowsCredentialStore
+from .auth_refresh import DesktopAuthRefresh
 from .oauth import (
     parse_oauth_bundle,
     resolve_oauth_access_token,
@@ -170,8 +173,8 @@ class DesktopBridge:
 
     def save_credential(self, credential_ref: str, token: str) -> dict[str, Any]:
         try:
-            ref = self._runtime.credential_store.save(credential_ref, token)
-            os.environ[ref] = token
+            ref = self._runtime.credential_store.validate_ref(credential_ref)
+            self._runtime._auth_refresh.save(ref, token)
             self._runtime.refresh_credential_refs()
             return {"ok": True, "credential_ref": ref}
         except Exception as exc:
@@ -186,8 +189,7 @@ class DesktopBridge:
     def forget_credential(self, credential_ref: str) -> dict[str, Any]:
         try:
             ref = self._runtime.credential_store.validate_ref(credential_ref)
-            removed = self._runtime.credential_store.forget(ref)
-            os.environ.pop(ref, None)
+            removed = self._runtime._auth_refresh.forget(ref)
             self._runtime.refresh_credential_refs()
             return {"ok": True, "removed": removed}
         except Exception as exc:
@@ -205,6 +207,21 @@ class DesktopBridge:
             save_config(config)
             self._runtime.restart_required = True
             return {"ok": True, "source_root": str(selected), "restart_required": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def choose_dataset_files(self, folder: bool = False) -> dict[str, Any]:
+        try:
+            import webview
+            if not isinstance(folder, bool):
+                raise ValueError("folder must be true or false")
+            result = self._runtime.window.create_file_dialog(
+                webview.FileDialog.FOLDER if folder else webview.FileDialog.OPEN,
+                allow_multiple=not folder,
+            )
+            if not result:
+                return {"ok": False, "cancelled": True}
+            return {"ok": True, **self._runtime.service.datasets.select(result, folder=folder)}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -247,6 +264,7 @@ class DesktopRuntime:
         self.database_path = self.data_root / "control-plane.sqlite3"
         migrate_legacy_database(self.database_path, legacy_db)
         self.credential_store = WindowsCredentialStore()
+        self._auth_refresh = DesktopAuthRefresh(self.credential_store)
         self.restart_required = False
         self.service: ControlPlaneService | None = None
         self.api_server = None
@@ -273,30 +291,11 @@ class DesktopRuntime:
                 os.environ[ref] = access_token
         self.refresh_credential_refs()
 
-    def _refresh_oauth_credential(self, credential_ref: str) -> None:
-        stored = self.credential_store.load(credential_ref)
-        bundle = parse_oauth_bundle(stored)
-        if bundle is None:
-            return
-        access_token, refreshed = resolve_oauth_access_token(bundle)
-        self.credential_store.save(
-            credential_ref, serialize_oauth_bundle(refreshed)
-        )
-        os.environ[credential_ref] = access_token
+    def _refresh_oauth_credential(self, credential_ref: str) -> bool:
+        return self._auth_refresh.ensure(credential_ref, force=True)
 
     def refresh_oauth_credentials_async(self) -> None:
-        def refresh_all() -> None:
-            for ref in self.credential_store.list_refs():
-                try:
-                    self._refresh_oauth_credential(ref)
-                except Exception:
-                    # Account availability and quota sync expose refresh failures
-                    # without leaking credential material into desktop logs.
-                    continue
-
-        threading.Thread(
-            target=refresh_all, name="kcp-oauth-refresh", daemon=True
-        ).start()
+        self._auth_refresh.start()
 
     def start_kaggle_oauth(self, credential_ref: str) -> dict[str, Any]:
         try:
@@ -311,8 +310,7 @@ class DesktopRuntime:
         def authenticate() -> None:
             try:
                 username, bundle = run_browser_oauth()
-                self.credential_store.save(ref, serialize_oauth_bundle(bundle))
-                os.environ[ref] = str(bundle.get("access_token") or "")
+                self._auth_refresh.save(ref, serialize_oauth_bundle(bundle))
                 self.refresh_credential_refs()
                 result = {
                     "state": "succeeded",
@@ -350,11 +348,15 @@ class DesktopRuntime:
         if not kaggle_cli:
             raise RuntimeError("Kaggle CLI is missing. Run the Setup installer again while connected to the internet.")
         os.environ["KCP_KAGGLE_EXECUTABLE"] = kaggle_cli
+        vault = EnvCredentialVault(auth_refresh=self._auth_refresh)
+        adapter = KaggleCliAdapter(executable=kaggle_cli, auth_env_refresh=vault.refresh_subprocess_env)
         self.service = ControlPlaneService(
             self.database_path,
             data_dir=self.data_root / "runtime",
             allowed_source_root=self.source_root,
             adapter_name="kaggle",
+            vault=vault,
+            adapter=adapter,
             max_workers=10,
             max_jobs_per_account=2,
             quota_start_delay_seconds=8,
@@ -379,6 +381,7 @@ class DesktopRuntime:
                 server.server_close()
         if self.service:
             self.service.close()
+        self._auth_refresh.stop()
         for ref in self.credential_store.list_refs():
             os.environ.pop(ref, None)
 

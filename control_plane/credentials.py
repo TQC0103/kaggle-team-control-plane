@@ -65,8 +65,12 @@ def validate_env_ref(value: str) -> str:
 class EnvCredentialVault:
     """Resolve Kaggle credentials from the service process environment."""
 
-    def __init__(self, environ: Mapping[str, str] | None = None):
+    def __init__(self, environ: Mapping[str, str] | None = None, *, auth_refresh=None):
         self._environ = environ if environ is not None else os.environ
+        self._auth_refresh = auth_refresh
+
+    def authentication_status(self, credential_env_ref: str | None):
+        return self._auth_refresh.status(credential_env_ref) if self._auth_refresh else {"state": "unmanaged"}
 
     def is_available(self, credential_env_ref: str | None) -> bool:
         return bool(credential_env_ref and self._environ.get(credential_env_ref))
@@ -74,6 +78,8 @@ class EnvCredentialVault:
     def credential_identity_hint(self, credential_env_ref: str) -> tuple[str | None, dict[str, str]]:
         """Return a legacy username hint and minimal Kaggle auth variables."""
         validate_env_ref(credential_env_ref)
+        if self._auth_refresh:
+            self._auth_refresh.ensure(credential_env_ref)
         raw = self._environ.get(credential_env_ref)
         if not raw:
             raise ValidationError(
@@ -131,4 +137,21 @@ class EnvCredentialVault:
         }
         child_env.update(credentials)
         child_env["KAGGLE_CONFIG_DIR"] = str(Path(isolated_config_dir).resolve())
+        if self._auth_refresh:
+            child_env["KCP_CREDENTIAL_REF"] = credential_env_ref
         return child_env
+
+    def refresh_subprocess_env(self, env: dict[str, str], force: bool = False) -> bool:
+        """Update a long-running worker before each CLI invocation, in place."""
+        ref = env.get("KCP_CREDENTIAL_REF")
+        if not self._auth_refresh or not ref:
+            return False
+        validate_env_ref(ref)
+        renewable = self._auth_refresh.ensure(ref, force=force, observed_token=env.get("KAGGLE_API_TOKEN"))
+        username, credentials = self.credential_identity_hint(ref)
+        if username and username.casefold() != env.get("KAGGLE_USERNAME", "").casefold():
+            raise ValidationError("credential username does not match the assigned Kaggle account")
+        for key in ("KAGGLE_API_TOKEN", "KAGGLE_KEY"):
+            env.pop(key, None)
+        env.update(credentials)
+        return renewable

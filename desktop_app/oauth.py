@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from kagglesdk import KaggleCredentials, KaggleEnv, KaggleOAuth
@@ -64,16 +64,20 @@ def run_browser_oauth() -> tuple[str, dict[str, Any]]:
 
 def resolve_oauth_access_token(
     bundle: dict[str, Any],
+    *, force: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Return a valid access token and the possibly refreshed OAuth bundle."""
     expiration_text = str(bundle.get("access_token_expiration") or "")
     expiration = datetime.fromisoformat(expiration_text) if expiration_text else None
+    if expiration is not None and expiration.tzinfo is None:
+        expiration = expiration.replace(tzinfo=timezone.utc)
+    renew = force or expiration is None or expiration <= datetime.now(timezone.utc) + timedelta(minutes=5)
     with KaggleClient(env=KaggleEnv.PROD) as client:
         credentials = InMemoryKaggleCredentials(
             client=client,
             refresh_token=str(bundle["refresh_token"]),
-            access_token=str(bundle.get("access_token") or ""),
-            access_token_expiration=expiration,
+            access_token="" if renew else str(bundle.get("access_token") or ""),
+            access_token_expiration=None if renew else expiration,
             username=str(bundle["username"]),
             scopes=[str(scope) for scope in bundle.get("scopes") or OAUTH_SCOPES],
         )

@@ -245,10 +245,33 @@ class KaggleCliAdapter:
         executable: str | None = None,
         command_poll_seconds: float = 0.1,
         live_log_capture_seconds: float = 8.0,
+        auth_env_refresh=None,
     ):
         self.executable = executable or os.environ.get("KCP_KAGGLE_EXECUTABLE", "kaggle")
         self.command_poll_seconds = command_poll_seconds
         self.live_log_capture_seconds = max(0.1, live_log_capture_seconds)
+        self.auth_env_refresh = auth_env_refresh
+
+    @staticmethod
+    def _auth_failure(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(term in message for term in (
+            "authentication required", "authentication failed", "401 unauthorized",
+            "401 client error", "token has expired", "invalid access token",
+        ))
+
+    @staticmethod
+    def _read_only(args: list[str]) -> bool:
+        if args and args[0] == "quota":
+            return True
+        pair = tuple(args[:2])
+        if pair == ("datasets", "metadata"):
+            return "--update" not in args
+        return pair in {
+            ("kernels", "status"), ("kernels", "logs"), ("kernels", "output"),
+            ("kernels", "list"), ("datasets", "status"), ("datasets", "files"),
+            ("datasets", "download"), ("datasets", "list"),
+        }
 
     def _run(
         self,
@@ -257,6 +280,24 @@ class KaggleCliAdapter:
         cancel_event: threading.Event,
         *,
         timeout_seconds: float | None = None,
+    ) -> str:
+        if cancel_event.is_set():
+            raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
+        if self.auth_env_refresh:
+            self.auth_env_refresh(env, False)
+        try:
+            return self._run_once(args, env, cancel_event, timeout_seconds=timeout_seconds)
+        except AdapterError as exc:
+            # Never replay push/create/update or an ambiguous remote mutation.
+            if not self.auth_env_refresh or not self._read_only(args) or not self._auth_failure(exc) or cancel_event.is_set():
+                raise
+            if self.auth_env_refresh(env, True) is False:
+                raise
+            return self._run_once(args, env, cancel_event, timeout_seconds=timeout_seconds)
+
+    def _run_once(
+        self, args: list[str], env: dict[str, str], cancel_event: threading.Event,
+        *, timeout_seconds: float | None = None,
     ) -> str:
         if cancel_event.is_set():
             raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
@@ -331,6 +372,22 @@ class KaggleCliAdapter:
         args: list[str],
         env: dict[str, str],
         cancel_event: threading.Event,
+    ) -> str:
+        if cancel_event.is_set():
+            raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
+        if self.auth_env_refresh:
+            self.auth_env_refresh(env, False)
+        try:
+            return self._run_follow_snapshot_once(args, env, cancel_event)
+        except AdapterError as exc:
+            if not self.auth_env_refresh or not self._auth_failure(exc) or cancel_event.is_set():
+                raise
+            if self.auth_env_refresh(env, True) is False:
+                raise
+            return self._run_follow_snapshot_once(args, env, cancel_event)
+
+    def _run_follow_snapshot_once(
+        self, args: list[str], env: dict[str, str], cancel_event: threading.Event,
     ) -> str:
         """Capture a bounded snapshot from Kaggle's live SSE log stream.
 

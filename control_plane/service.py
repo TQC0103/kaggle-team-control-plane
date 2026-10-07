@@ -30,6 +30,7 @@ from .database import Database
 from .errors import ConflictError, ValidationError
 from .scheduler import JobScheduler
 from .version import build_identity
+from .datasets import DatasetManager
 
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$")
@@ -105,6 +106,7 @@ class ControlPlaneService:
             else:
                 raise ValidationError("adapter_name must be fake or kaggle")
         self.adapter = adapter
+        self.datasets = DatasetManager(self)
         self._recovery_stop = threading.Event()
         # Recovery keeps checking a remotely active kernel after a desktop
         # restart.  Retain its last observed state in memory so a long Kaggle
@@ -154,6 +156,7 @@ class ControlPlaneService:
 
     def close(self) -> None:
         self._recovery_stop.set()
+        self.datasets.close()
         self.scheduler.close()
 
     def _schedule_recovered_job_recheck(self, job_id: str) -> None:
@@ -484,6 +487,8 @@ class ControlPlaneService:
         account["credential_available"] = self.vault.is_available(
             account.get("credential_env_ref")
         )
+        if hasattr(self.vault, "authentication_status"):
+            account["authentication"] = self.vault.authentication_status(account.get("credential_env_ref"))
         account["active_runs"] = self.scheduler.active_jobs_for_account(account["id"])
         account["max_parallel"] = self.scheduler.max_jobs_per_account
         # Legacy local-estimate columns remain in SQLite only for forward

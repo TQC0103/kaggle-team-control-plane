@@ -16,6 +16,8 @@ batch and the local worker pool at ten jobs; it does not require ten accounts.
 ## What is included
 
 - Python REST API, SQLite state, and a responsive local dashboard.
+- Desktop dataset uploads, explicit private/public visibility, reader permissions,
+  remote metadata inspection, and persistent background-operation history.
 - One isolated Kaggle CLI environment and staging directory per job.
 - Account onboarding with owner consent, pause, permanent revoke, and audit.
 - No durable plaintext credentials: SQLite stores only an environment-variable
@@ -27,6 +29,54 @@ batch and the local worker pool at ten jobs; it does not require ten accounts.
 - A credential-free fake adapter and seeded 10-account/10-job demo.
 
 ## Requirements
+
+### Dataset management
+
+Open **Datasets → Upload dataset**, select an authenticated owner account, choose
+files or a dedicated folder, and review its file count/size. Private is the default;
+public exposure requires an explicit selection and confirmation. Readers can be
+added by Kaggle username or through the account shortcuts. Nested folders become
+ZIP archives via the Kaggle CLI. Uploading a new dataset never overwrites an
+existing dataset or creates a new version of it.
+
+For an existing dataset, enter `owner/slug` and select **Inspect & manage**. The
+owner can edit title, description, visibility, and readers. Other metadata,
+license, and writer/admin roles are preserved. KCP verifies the remote visibility
+and permissions when Kaggle returns them; if a change is refused or cannot be
+verified, the operation displays an error or a permission-verification notice.
+Kaggle's omitted default fields are interpreted using its metadata contract
+(public visibility and an empty collaborator list). Accounts with reader access
+can inspect files/status, but only the selected owner can change settings.
+
+Uploads run in the background, separate from GPU jobs; phase indicators describe
+actual steps rather than estimating an upload percentage. Temporary staged copies
+are removed after completion/failure. Original files are untouched. After an app
+restart, an unfinished operation is marked **interrupted**; inspect the remote
+dataset before a new submission. KCP does not automatically replay uploads.
+
+Local API endpoints (same origin/auth rules as the other KCP API routes):
+
+- `POST /api/datasets/prepare`: preview a dedicated `source_dir` inside the
+  configured source root; returns an opaque `selection_id` and file manifest.
+  The desktop native picker can explicitly select files outside that root.
+- `POST /api/datasets/operations`: submit `kind: upload|settings`, `account_id`,
+  `dataset_ref`, `title`, `description`, `is_private` (default true), `readers`,
+  `idempotency_key`; uploads also need `selection_id` and an optional `license`
+  (default `other`). Public operations require `confirm_public: true`.
+  Returns HTTP 202 and an operation ID. Repeat the same idempotency key/request
+  to retrieve the existing operation instead of uploading again.
+- `GET /api/datasets/operations` and `GET /api/datasets/operations/{id}`:
+  saved phase/status/error and uploaded source-file SHA256 values.
+- `POST /api/datasets/inspect`: read metadata, file list, and Kaggle status using
+  `account_id` and `dataset_ref`.
+
+The existing `/api/datasets/private-checkpoint/*` routes remain compatible.
+Credentials are resolved by KCP internally, never accepted in dataset payloads.
+Credential/config files, links, protected directories and KCP's internal data
+cannot be selected. Each selection is limited to 10,000 files / 100 GiB; one
+dataset mutation per account runs at a time, with different accounts independent.
+
+### Runtime requirements
 
 - Windows PowerShell 5.1 or PowerShell 7.
 - Python 3.11 or newer.
@@ -75,6 +125,14 @@ never enter Control Plane. The returned refresh credential is kept only in the
 Windows DPAPI store; access tokens are refreshed in memory and passed only to
 the explicitly assigned job subprocess. The OAuth flow deliberately bypasses
 Kaggle's default plaintext `~/.kaggle/credentials.json` persistence.
+
+OAuth credentials are checked every minute and renewed five minutes before
+expiry. Each CLI call reloads the latest token, including workers monitoring
+long-running jobs. A per-account lock prevents competing refreshes; temporary
+refresh errors back off automatically. Read-only commands that report expired
+authentication force one refresh and retry once. Remote writes are never
+replayed automatically. Revoked or expired refresh grants require reconnecting
+the account; their public authentication state is `relogin_required`.
 
 ### Windows desktop app
 
