@@ -549,6 +549,10 @@ class KaggleCliAdapter:
         output = self._run(
             args, env, cancel_event
         )
+        # Kaggle can reject a push while its CLI still exits with code zero.
+        # Never let an existing kernel's status hide an explicit push failure.
+        if re.search(r"\bKernel\s+push\s+error\s*:", output, re.IGNORECASE):
+            raise AdapterError(output[-2000:])
         expected_owner, expected_slug = job["kernel_slug"].split("/", 1)
         match = KAGGLE_KERNEL_URL_PATTERN.search(output)
         if match:
@@ -574,17 +578,17 @@ class KaggleCliAdapter:
             cancel_event,
             timeout_seconds=20,
         )
-        normalized = output.casefold()
-        if any(word in normalized for word in ("error", "failed", "failure")):
-            state = "failed"
-        elif any(word in normalized for word in ("complete", "success")):
-            state = "complete"
-        elif "cancel" in normalized:
-            state = "cancelled"
-        elif any(word in normalized for word in ("running", "active")):
-            state = "running"
-        else:
-            state = "queued"
+        # The CLI wraps the actual enum in 'has status "..."'. A warning,
+        # empty response or HTTP error is not evidence of a queued session.
+        match = re.search(
+            r"\bhas\s+status\s+[\"']?(?:KernelWorkerStatus\.)?(queued|running|complete|error|cancelled|canceled)\b",
+            output, re.IGNORECASE,
+        )
+        if not match:
+            raise AdapterError("Unrecognized Kaggle kernel status response: " + output[-2000:])
+        state = {"error": "failed", "canceled": "cancelled"}.get(
+            match.group(1).lower(), match.group(1).lower()
+        )
         return RemoteStatus(state, output[-2000:])
 
     def output(

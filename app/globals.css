@@ -656,6 +656,7 @@ a:focus-visible {
 .status-badge { padding: 6px 8px; border-radius: 20px; background: #eee; }
 .status-running { color: #3a58d0; background: #edf0ff; }
 .status-queued { color: #86620a; background: #fff5d4; }
+.status-submitting { color: #86620a; background: #fff5d4; }
 .status-succeeded { color: #197f4e; background: #e8f7ef; }
 .status-failed, .status-cancelled { color: #ac3c2e; background: #fdece8; }
 .run-progress { width: 116px; display: flex; align-items: center; gap: 8px; }

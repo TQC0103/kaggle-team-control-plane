@@ -191,6 +191,24 @@ class KaggleCliAdapterTests(unittest.TestCase):
                 "Traceback: remote failure",
             )
 
+    def test_zero_exit_push_rejection_is_not_a_submission(self) -> None:
+        adapter = KaggleCliAdapter()
+        adapter._run = lambda *a, **kw: "Kernel push error: Maximum batch GPU session count of 2 reached."
+        with self.assertRaisesRegex(AdapterError, "Maximum batch GPU session"):
+            adapter.submit({"source_dir": "staged", "kernel_slug": "owner/slug"}, {}, threading.Event())
+
+    def test_status_requires_an_explicit_remote_enum(self) -> None:
+        adapter = KaggleCliAdapter()
+        for response in ("", "temporary service error", "404 Not Found", "still waiting", "queued"):
+            with self.subTest(response=response):
+                adapter._run = lambda *a, **kw: response
+                with self.assertRaisesRegex(AdapterError, "Unrecognized"):
+                    adapter.status({"kernel_slug": "owner/slug"}, {}, threading.Event())
+        for enum, expected in (("QUEUED", "queued"), ("RUNNING", "running"), ("COMPLETE", "complete"), ("ERROR", "failed"), ("CANCELLED", "cancelled")):
+            for prefix in ("", "KernelWorkerStatus."):
+                adapter._run = lambda *a, **kw: f'owner/slug has status "{prefix}{enum}"'
+                self.assertEqual(adapter.status({"kernel_slug": "owner/slug"}, {}, threading.Event()).state, expected)
+
     def test_live_logs_use_bounded_follow_stream(self) -> None:
         adapter = KaggleCliAdapter()
         calls = []
@@ -427,6 +445,74 @@ class StorageAndCredentialsTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_startup_repairs_zero_exit_rejection_and_preserves_unverified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            kwargs = dict(data_dir=root/'data', allowed_source_root=root, adapter=FakeKaggleAdapter(),
+                vault=EnvCredentialVault({'REPAIR_ACCOUNT':'token'}), start_scheduler=False)
+            first = ControlPlaneService(root/'state.sqlite3', **kwargs)
+            try:
+                account = first.create_account(account_payload('repair-user','REPAIR_ACCOUNT'),'tester')
+                batch = first.create_batch({'name':'repair', 'jobs':[
+                    {'account_id':account['id'],'experiment_name':name,'source_dir':str(make_source(root,name)),
+                     'kernel_slug':name} for name in ('rejected','unverified')]},'tester')
+                rejected, unverified = [r['id'] for r in batch['jobs']]
+                first.database.transition_job(rejected, {'queued'}, 'submitted', fields={
+                    'result':{'submit':{'cli_message':'Kernel push error: Maximum batch GPU session count of 2 reached.'}},
+                    'remote_may_be_running':1})
+                first.database.transition_job(unverified, {'queued'}, 'submitting', fields={
+                    'result':{'submit':{'cli_message':'Kernel version 1 successfully pushed'}},'remote_may_be_running':1})
+            finally:first.close()
+            # Inspect the recovery boundary before any remote status has been
+            # queried; successful service reconciliation may then mark running.
+            first.database.recover_interrupted_jobs()
+            second = first
+            try:
+                row=second.get_job(rejected)
+                self.assertEqual(row['status'],'failed');self.assertFalse(row['remote_may_be_running'])
+                self.assertIn('Kernel push error:',row['result']['submit']['cli_message'])
+                self.assertEqual(second.get_job(unverified)['status'],'submitting')
+                self.assertTrue(any(e['message'].startswith('Repaired zero-exit') for e in row['events']))
+            finally:second.close()
+
+    def test_remote_verification_precedes_submitted_and_never_repushes(self) -> None:
+        allow_status = threading.Event()
+        status_attempted = threading.Event()
+        class DelayedSessionAdapter(FakeKaggleAdapter):
+            def __init__(self):
+                super().__init__(poll_delay_seconds=0.005)
+                self.pushes = 0
+            def submit(self, *a, **kw):
+                self.pushes += 1
+                return super().submit(*a, **kw)
+            def status(self, *a, **kw):
+                status_attempted.set()
+                if not allow_status.is_set():
+                    raise AdapterError("404 Not Found; propagation not yet verified")
+                return super().status(*a, **kw)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); adapter = DelayedSessionAdapter()
+            service = ControlPlaneService(root/'state.sqlite3', data_dir=root/'data', allowed_source_root=root,
+                adapter=adapter, vault=EnvCredentialVault({"VERIFY_ACCOUNT": "token"}),
+                remote_poll_seconds=0.005, dispatch_poll_seconds=0.005)
+            try:
+                account = service.create_account(account_payload("verify-user", "VERIFY_ACCOUNT"), "tester")
+                batch = service.create_batch({"name": "verify before submitted", "jobs": [{"account_id": account["id"],
+                    "experiment_name": "verify", "source_dir": str(make_source(root, "verify-source")),
+                    "kernel_slug": "verify-status", "metadata": {"fake_polls": 2}}]}, "tester")
+                job_id = batch['jobs'][0]['id']; self.assertTrue(status_attempted.wait(3))
+                row = service.get_job(job_id)
+                self.assertEqual(row['status'], 'submitting')
+                self.assertTrue(row['remote_may_be_running'])
+                self.assertFalse(any(e['message']=='Job status changed to submitted' for e in row['events']))
+                self.assertEqual(adapter.pushes, 1)
+                allow_status.set()
+                completed = wait_for_status(service, job_id, {'succeeded'})
+                self.assertIn('remote_verification', completed['result']['submit'])
+                self.assertEqual(adapter.pushes, 1)
+            finally:
+                allow_status.set(); service.close()
+
     def test_batch_submission_is_idempotent_and_detects_key_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

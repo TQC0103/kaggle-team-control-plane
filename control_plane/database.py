@@ -1011,6 +1011,32 @@ class Database:
         """
         now = utc_now()
         with self.connection() as connection:
+            # Repair historical zero-exit rejections from retained push proof.
+            # A job with confirmed remote work must never be reinterpreted.
+            push_rejections = connection.execute(
+                "SELECT id,result_json FROM jobs WHERE status IN ('submitting','submitted') "
+                "AND result_json IS NOT NULL AND NOT EXISTS "
+                "(SELECT 1 FROM job_events WHERE job_id=jobs.id AND "
+                "message IN ('Job status changed to running','Verified Kaggle remote session before marking submitted'))"
+            ).fetchall()
+            for rejected in push_rejections:
+                try:
+                    result = json.loads(rejected['result_json'])
+                    message = (result.get('submit') or {}).get('cli_message', '')
+                except (ValueError, AttributeError, TypeError):
+                    continue
+                if 'kernel push error:' not in message.lower():
+                    continue
+                connection.execute(
+                    "UPDATE jobs SET status='failed',remote_may_be_running=0,error=?,"
+                    "finished_at=COALESCE(finished_at,?),updated_at=? WHERE id=?",
+                    (message[-2000:], now, now, rejected['id']),
+                )
+                self.append_audit('scheduler','job.zero_exit_push_rejection_repaired','job',rejected['id'],
+                    {'remote_submission_confirmed': False},connection=connection)
+                self.append_job_event(rejected['id'],
+                    'Repaired zero-exit Kaggle push rejection; no remote session was accepted',
+                    level='error',connection=connection)
             # Older schedulers marked any attempted submit as remotely
             # uncertain, even when Kaggle returned a definite client error.
             # Repair only rows whose immutable event trace proves that a
@@ -1057,8 +1083,8 @@ class Database:
             ).fetchall()
             for row in rows:
                 connection.execute(
-                    "UPDATE jobs SET status=CASE WHEN status IN ('submitting','failed') "
-                    "THEN 'submitted' ELSE status END, remote_may_be_running=1, "
+                    "UPDATE jobs SET status=CASE WHEN status='failed' "
+                    "THEN 'submitting' ELSE status END, remote_may_be_running=1, "
                     "error=?, finished_at=NULL, updated_at=? WHERE id=?",
                     (
                         "control plane restarted; reconciling remote Kaggle status",

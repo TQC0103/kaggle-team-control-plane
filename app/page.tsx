@@ -11,7 +11,7 @@ import {
 } from "react";
 
 type AccountState = "ready" | "running" | "cooldown" | "blocked" | "offline";
-type RunState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+type RunState = "queued" | "submitting" | "running" | "succeeded" | "failed" | "cancelled";
 type ConnectionState = "checking" | "live" | "partial" | "offline";
 
 type BuildInfo = {
@@ -233,6 +233,7 @@ function normalizeStatus(value: string): RunState {
   if (["complete", "completed", "success", "succeeded"].includes(status)) return "succeeded";
   if (["error", "failed", "failure"].includes(status)) return "failed";
   if (["cancelled", "canceled", "aborted"].includes(status)) return "cancelled";
+  if (status === "submitting") return "submitting";
   if (["pending", "submitted", "queued"].includes(status)) return "queued";
   return "running";
 }
@@ -470,7 +471,7 @@ function StatusBadge({ status }: { status: RunState }) {
   return (
     <span className={`status-badge status-${status}`}>
       <span className="status-dot" aria-hidden="true" />
-      {status}
+      {status === "submitting" ? "Verifying submission" : status}
     </span>
   );
 }
@@ -571,7 +572,7 @@ export default function Home() {
       const nextRuns = list.map((item, index) => normalizeRun(item, index, nextAccounts));
       setRuns(nextRuns);
       nextAccounts = nextAccounts.map((account) => {
-        const activeRuns = nextRuns.filter((run) => run.accountId === account.id && (run.status === "running" || run.status === "queued")).length;
+        const activeRuns = nextRuns.filter((run) => run.accountId === account.id && ["running", "queued", "submitting"].includes(run.status)).length;
         const state: AccountState = account.controlState !== "enabled" || account.credentialAvailable === false
           ? "offline"
           : (account.remoteActiveRuns || 0) > 0 || activeRuns > 0
@@ -648,7 +649,7 @@ export default function Home() {
   }, [composerOpen, selectedRun, accountFormOpen, managedAccount, desktopSettingsOpen]);
 
   const readyCount = accounts.filter((item) => item.state === "ready" || item.state === "running").length;
-  const activeCount = runs.filter((item) => item.status === "running" || item.status === "queued").length;
+  const activeCount = runs.filter((item) => ["running", "queued", "submitting"].includes(item.status)).length;
   const totalCapacity = accounts.reduce((sum, item) => sum + item.maxParallel, 0);
   const remainingGpuQuota = accounts.reduce((sum, item) => sum + (item.gpuQuota.remainingHours || 0), 0);
   const totalGpuQuota = accounts.reduce((sum, item) => sum + (item.gpuQuota.totalHours || 0), 0);
@@ -688,7 +689,7 @@ export default function Home() {
   const actionableSelection = (action: "cancel" | "retry") => selectedRunIds
     .map((id) => runs.find((run) => run.id === id))
     .filter((run): run is Run => Boolean(run) && (action === "cancel"
-      ? run!.status === "running" || run!.status === "queued"
+      ? ["running", "queued", "submitting"].includes(run!.status)
       : run!.status === "failed" || run!.status === "cancelled"))
     .slice(0, 10);
 
@@ -908,7 +909,7 @@ export default function Home() {
             {accounts.map((account, index) => {
               const activeAccelerators = Array.from(new Set(
                 runs
-                  .filter((run) => run.accountId === account.id && (run.status === "running" || run.status === "queued"))
+                  .filter((run) => run.accountId === account.id && ["running", "queued", "submitting"].includes(run.status))
                   .map((run) => run.accelerator),
               ));
               const accountAccelerator = activeAccelerators.length
@@ -955,7 +956,7 @@ export default function Home() {
               <h2 id="runs-title">Experiments in motion.</h2>
             </div>
             <div className="run-tools"><label className="run-search"><span className="sr-only">Search runs</span><input value={runSearch} onChange={(event) => setRunSearch(event.target.value)} placeholder="Search runs…" /></label>{selectedRunIds.length > 0 && <div className="bulk-actions" aria-label="Selected run actions"><span>{selectedRunIds.length} selected</span><button type="button" onClick={() => void bulkRunAction("cancel")}>Cancel</button><button type="button" onClick={() => void bulkRunAction("retry")}>Retry</button><button type="button" onClick={() => setSelectedRunIds([])}>Clear</button></div>}<div className="export-actions"><button type="button" onClick={() => exportRuns("csv")}>CSV</button><button type="button" onClick={() => exportRuns("json")}>JSON</button></div><div className="filter-tabs" role="group" aria-label="Filter runs">
-              {(["all", "running", "queued", "succeeded", "failed"] as const).map((item) => (
+              {(["all", "running", "queued", "submitting", "succeeded", "failed"] as const).map((item) => (
                 <button key={item} className={filter === item ? "active" : ""} aria-pressed={filter === item} onClick={() => setFilter(item)}>{item}</button>
               ))}
             </div></div>
@@ -1575,7 +1576,7 @@ function BatchComposer({ accounts, connection, onClose, onCreated }: {
           })),
         }),
       });
-      onCreated(`Batch “${batchName.trim()}” submitted with ${drafts.length} experiments.`);
+      onCreated(`Batch “${batchName.trim()}” queued for submission with ${drafts.length} experiments.`);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Could not submit this batch.");
       setSubmitting(false);
@@ -1776,7 +1777,7 @@ function RunDrawer({ run, connection, onClose, onAction, onRefresh }: {
         <section className="log-panel" aria-labelledby="log-title"><header><h3 id="log-title">Live output</h3><div><span>Kaggle sync ≤30s · {logs.length} lines shown</span><button type="button" onClick={onRefresh} disabled={connection !== "live"}>Refresh</button></div></header>{hasOlderLogs && <div className="log-load-actions"><button type="button" className="load-more-logs load-older-logs" disabled={loadingOlderLogs} onClick={() => void loadOlderLogs()}>{loadingOlderLogs ? "Loading…" : "Load 500 earlier lines"}</button><button type="button" className="load-more-logs load-older-logs" disabled={loadingOlderLogs} onClick={() => void loadAllOlderLogs()}>{loadingOlderLogs ? "Loading…" : "Load all earlier lines"}</button></div>}<pre>{logs.map((line, index) => <code key={`${line}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span>{line}</code>)}</pre></section>
         {downloadError && <p className="drawer-download-error" role="alert">{downloadError}</p>}
         <footer className="drawer-actions">
-          {(run.status === "running" || run.status === "queued") && <button className="button button-danger" onClick={() => onAction(run, "cancel")}>Cancel run</button>}
+          {["running", "queued", "submitting"].includes(run.status) && <button className="button button-danger" onClick={() => onAction(run, "cancel")}>Cancel run</button>}
           {(run.status === "failed" || run.status === "cancelled") && <button className="button button-primary" onClick={() => onAction(run, "retry")}>Retry run</button>}
           {run.status === "succeeded" && <button className="button button-primary" onClick={() => onAction(run, "result")}>Get results</button>}
           <button className="button button-quiet" disabled={downloading !== null || connection !== "live"} onClick={() => void download("logs")}>{downloading === "logs" ? "Preparing logs…" : "Download logs"}</button>

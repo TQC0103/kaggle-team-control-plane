@@ -401,16 +401,52 @@ class JobScheduler:
             submit_started = True
             raw_submit_result = self.adapter.submit(staged_job, env, cancel_event)
             submit_result = self._redact(raw_submit_result, env)
+            submitted = True  # Push returned; acceptance still needs remote proof.
             self.database.append_job_event(
                 job_id,
-                "Submitted the staged kernel to Kaggle",
+                "Kaggle push returned; verifying remote kernel before marking submitted",
                 details={"submit": submit_result},
             )
-            submitted = True
+            self.database.transition_job(
+                job_id, {"submitting"}, "submitting",
+                fields={"result": {"submit": submit_result}, "remote_may_be_running": 1},
+            )
+            verification_error_reported = False
+            while not cancel_event.is_set():
+                try:
+                    verified = self.adapter.status(staged_job, env, cancel_event)
+                    if verified.state not in {"queued", "running", "complete", "failed", "cancelled"}:
+                        raise AdapterError("Kaggle has not returned a recognized remote session state")
+                    break
+                except LocalCommandCancelled:
+                    raise
+                except Exception as exc:
+                    safe_error = self._redact(str(exc), env)[:2000]
+                    self.database.transition_job(
+                        job_id, {"submitting"}, "submitting",
+                        fields={"error": "Remote submission not yet verified: " + safe_error,
+                                "remote_may_be_running": 1},
+                    )
+                    if not verification_error_reported:
+                        self.database.append_job_event(
+                            job_id, "Remote submission unverified; retrying status only, never pushing again",
+                            details={"error": safe_error}, level="warning",
+                        )
+                        verification_error_reported = True
+                    if cancel_event.wait(self.remote_poll_seconds):
+                        break
             if cancel_event.is_set():
                 raise LocalCommandCancelled("cancel requested after submit")
+            submit_result["remote_verification"] = {
+                "state": verified.state, "detail": self._redact(verified.detail, env),
+            }
+            self.database.append_job_event(
+                job_id, "Verified Kaggle remote session before marking submitted",
+                details={"remote_verification": submit_result["remote_verification"]},
+            )
             changed = self.database.transition_job(
-                job_id, {"submitting"}, "submitted"
+                job_id, {"submitting"}, "submitted",
+                fields={"result": {"submit": submit_result}, "error": None, "remote_may_be_running": 0},
             )
             if not changed:
                 raise LocalCommandCancelled("job state changed while submitting")
@@ -667,8 +703,8 @@ class JobScheduler:
                 # reconciliation restores the actual remote status.
                 active_state = (
                     current["status"]
-                    if current["status"] in {"submitted", "running"}
-                    else "submitted"
+                    if current["status"] in {"submitting", "submitted", "running"}
+                    else "submitting"
                 )
                 self.database.transition_job(
                     job_id,
