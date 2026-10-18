@@ -204,7 +204,7 @@ class KaggleCliAdapterTests(unittest.TestCase):
                 adapter._run = lambda *a, **kw: response
                 with self.assertRaisesRegex(AdapterError, "Unrecognized"):
                     adapter.status({"kernel_slug": "owner/slug"}, {}, threading.Event())
-        for enum, expected in (("QUEUED", "queued"), ("RUNNING", "running"), ("COMPLETE", "complete"), ("ERROR", "failed"), ("CANCELLED", "cancelled")):
+        for enum, expected in (("QUEUED", "queued"), ("RUNNING", "running"), ("COMPLETE", "complete"), ("ERROR", "failed"), ("CANCELLED", "cancelled"), ("CANCEL_REQUESTED", "running"), ("CANCEL_ACKNOWLEDGED", "cancelled")):
             for prefix in ("", "KernelWorkerStatus."):
                 adapter._run = lambda *a, **kw: f'owner/slug has status "{prefix}{enum}"'
                 self.assertEqual(adapter.status({"kernel_slug": "owner/slug"}, {}, threading.Event()).state, expected)

@@ -581,12 +581,13 @@ class KaggleCliAdapter:
         # The CLI wraps the actual enum in 'has status "..."'. A warning,
         # empty response or HTTP error is not evidence of a queued session.
         match = re.search(
-            r"\bhas\s+status\s+[\"']?(?:KernelWorkerStatus\.)?(queued|running|complete|error|cancelled|canceled)\b",
+            r"\bhas\s+status\s+[\"']?(?:KernelWorkerStatus\.)?(queued|running|complete|error|cancelled|canceled|cancel_requested|cancel_acknowledged)\b",
             output, re.IGNORECASE,
         )
         if not match:
             raise AdapterError("Unrecognized Kaggle kernel status response: " + output[-2000:])
-        state = {"error": "failed", "canceled": "cancelled"}.get(
+        state = {"error": "failed", "canceled": "cancelled",
+                 "cancel_requested": "running", "cancel_acknowledged": "cancelled"}.get(
             match.group(1).lower(), match.group(1).lower()
         )
         return RemoteStatus(state, output[-2000:])
