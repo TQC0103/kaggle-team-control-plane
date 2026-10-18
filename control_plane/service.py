@@ -31,6 +31,7 @@ from .errors import ConflictError, ValidationError
 from .scheduler import JobScheduler
 from .version import build_identity
 from .datasets import DatasetManager
+from .execution_profiles import GPU_SHAPES, validate_profile
 
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$")
@@ -46,7 +47,7 @@ SECRET_INPUT_FIELDS = {
     "access_token",
     "client_secret",
 }
-GPU_MACHINE_SHAPES = {DEFAULT_GPU_MACHINE_SHAPE}
+GPU_MACHINE_SHAPES = GPU_SHAPES
 TPU_MACHINE_SHAPES = {DEFAULT_TPU_MACHINE_SHAPE}
 
 
@@ -792,7 +793,7 @@ class ControlPlaneService:
                 if machine_shape not in GPU_MACHINE_SHAPES:
                     raise ValidationError(
                         f"jobs[{index}].metadata.machine_shape must be "
-                        f"{DEFAULT_GPU_MACHINE_SHAPE} for GPU jobs"
+                        "a supported shape from /api/accelerators/catalog"
                     )
                 metadata["machine_shape"] = machine_shape
             elif accelerator == "tpu":
@@ -830,6 +831,9 @@ class ControlPlaneService:
                     f"{self.allowed_source_root}"
                 )
             source_dir = str(source_path)
+            offline = validate_profile(source_path, str(machine_shape or 'CPU'),
+                (account.get('official_quota') or {}).get('gpu',{}).get('remaining_hours'))
+            if offline:metadata['offline_preflight'] = offline
             output_dir = raw.get("output_dir")
             if output_dir is not None:
                 raise ValidationError(

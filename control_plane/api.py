@@ -202,6 +202,13 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             return 200, service.health()
         if method == "GET" and path == "/api/accounts":
             return 200, {"accounts": service.list_accounts()}
+        if method == 'GET' and path == '/api/accelerators/catalog':
+            from .execution_profiles import catalog
+            return 200, catalog()
+        competition_access = re.fullmatch(r'/api/accounts/([^/]+)/competitions', path)
+        if method == 'GET' and competition_access:
+            from .competition_access import entered_competitions
+            return 200, entered_competitions(service, competition_access.group(1))
         if method == "GET" and path == "/api/datasets/operations":
             return 200, {"operations": service.datasets.list_operations()}
         dataset_operation = re.fullmatch(r"/api/datasets/operations/([a-f0-9]{32})", path)

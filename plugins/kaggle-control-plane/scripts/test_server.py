@@ -29,6 +29,19 @@ def test_redaction() -> None:
     assert value == {"token": "[REDACTED]", "nested": {"api_key": "[REDACTED]", "credential_available": True}}
 
 
+def test_competition_discovery_only_uses_get() -> None:
+    with mock.patch.object(SERVER, "_request", return_value=({"membership_only": True}, {})) as request:
+        SERVER._call("kcp_competition_access", {"account_id": "acct-1"})
+        request.assert_called_once_with("/api/accounts/acct-1/competitions", timeout=45)
+
+
+def test_advanced_shapes_in_schema_have_no_generic_fallback() -> None:
+    schema = next(t for t in SERVER.TOOLS if t['name'] == 'kcp_submit_batch')['inputSchema']
+    shapes = schema['properties']['jobs']['items']['properties']['machine_shape']['enum']
+    assert 'NvidiaL4' in shapes and 'NvidiaH100' in shapes
+    assert 'NvidiaL4x4' not in shapes and 'NvidiaTeslaP100' not in shapes
+
+
 def test_status_summary() -> None:
     responses = [
         ({"version": "0.2.0-beta.1", "build_sha": "abc123"}, {}),

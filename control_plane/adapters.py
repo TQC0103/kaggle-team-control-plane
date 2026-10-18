@@ -206,6 +206,13 @@ def stage_job_source(
     # remote slug and then fail status polling against the requested id.
     metadata["title"] = expected_id.split("/", 1)[1]
     metadata["code_file"] = code_files[0].name
+    # Recheck after claim: a source edit between batch creation and staging
+    # must not silently re-enable network or change the offline runtime.
+    from .execution_profiles import validate_profile
+    offline = validate_profile(source, str(job.get('metadata',{}).get('machine_shape') or 'CPU'))
+    prior = job.get('metadata',{}).get('offline_preflight')
+    if prior is not None and offline != prior:
+        raise AdapterError('Offline profile changed after batch creation')
     accelerator = str(job.get("metadata", {}).get("accelerator", "auto"))
     machine_shape = str(job.get("metadata", {}).get("machine_shape", ""))
     if accelerator == "gpu":
@@ -270,6 +277,7 @@ class KaggleCliAdapter:
         return pair in {
             ("kernels", "status"), ("kernels", "logs"), ("kernels", "output"),
             ("kernels", "list"), ("datasets", "status"), ("datasets", "files"),
+            ("competitions", "list"),
             ("datasets", "download"), ("datasets", "list"),
         }
 

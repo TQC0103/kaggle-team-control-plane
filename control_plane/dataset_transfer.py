@@ -14,7 +14,7 @@ _LOCK = threading.Lock()
 _REF = re.compile(r"^[A-Za-z0-9_-]{1,50}/[A-Za-z0-9_-]{6,50}$")
 
 
-def _account_cli(service, account_id):
+def _account_cli(service, account_id, *, max_text_chars=8000):
     account = service.database.get_account(account_id)
     if account["state"] != "enabled" or not account.get("credential_env_ref"):
         raise ValidationError("an enabled authenticated account is required")
@@ -31,7 +31,9 @@ def _account_cli(service, account_id):
             output = service.adapter._run(args, env, threading.Event(), timeout_seconds=timeout)
         except Exception as exc:
             raise ValidationError(service.scheduler._redact(str(exc), env)[:1500]) from None
-        return service.scheduler._redact(output, env)
+        if max_text_chars == 8000:
+            return service.scheduler._redact(output, env)
+        return service.scheduler._redact(output, env, max_text_chars=max_text_chars)
 
     return account, run
 

@@ -42,6 +42,7 @@ try {
         --paths $projectRoot `
         --collect-all webview `
         --hidden-import webview.platforms.edgechromium `
+        --add-data "$(Join-Path $projectRoot 'control_plane\offline_runtime.py');control_plane" `
         --add-data "$(Join-Path $projectRoot 'dist\client');dist\client" `
         (Join-Path $projectRoot 'desktop_app.py')
     if ($LASTEXITCODE -ne 0) { throw 'Desktop packaging failed.' }

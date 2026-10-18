@@ -15,6 +15,7 @@ from typing import Any
 
 BASE_URL = os.environ.get("KCP_BASE_URL", "http://127.0.0.1:8765").rstrip("/")
 PROTOCOL_VERSION = "2025-06-18"
+GPU_SHAPES = ["NvidiaTeslaT4", "NvidiaL4", "NvidiaL4X1", "NvidiaTeslaA100", "NvidiaH100", "NvidiaRtxPro6000"]
 
 
 def _schema(properties: dict[str, Any] | None = None, required: list[str] | None = None) -> dict[str, Any]:
@@ -27,6 +28,16 @@ def _schema(properties: dict[str, Any] | None = None, required: list[str] | None
 
 
 TOOLS = [
+    {
+        "name": "kcp_accelerator_catalog",
+        "description": "List supported Kaggle GPU IDs and offline profile requirements. Listing is not account entitlement.",
+        "inputSchema": _schema(),
+    },
+    {
+        "name": "kcp_competition_access",
+        "description": "Read competitions already entered by an account. Does not join, accept rules, or prove GPU entitlement.",
+        "inputSchema": _schema({"account_id": {"type": "string", "minLength": 1}}, ["account_id"]),
+    },
     {
         "name": "kcp_status",
         "description": "Check whether Control Plane is reachable and summarize accounts and jobs.",
@@ -95,8 +106,8 @@ TOOLS = [
                             "accelerator": {"type": "string", "enum": ["gpu", "tpu", "cpu"]},
                             "machine_shape": {
                                 "type": "string",
-                                "enum": ["NvidiaTeslaT4", "TpuV38"],
-                                "description": "Exact Kaggle machine shape. Use NvidiaTeslaT4 for GPU or TpuV38 for TPU; omit for CPU.",
+                                "enum": GPU_SHAPES + ["TpuV38"],
+                                "description": "Exact shape; advanced GPUs require a validated competition offline profile and account access. Omit for CPU.",
                             },
                         },
                         ["account_id", "experiment_name", "source_dir", "kernel_slug", "accelerator"],
@@ -217,8 +228,8 @@ def _source_job(job: dict[str, Any]) -> dict[str, Any]:
     machine_shape = cleaned.pop("machine_shape", None)
     if accelerator == "gpu":
         machine_shape = machine_shape or "NvidiaTeslaT4"
-        if machine_shape != "NvidiaTeslaT4":
-            raise ValueError("GPU jobs currently require machine_shape NvidiaTeslaT4")
+        if machine_shape not in GPU_SHAPES:
+            raise ValueError("Unsupported GPU shape; inspect kcp_accelerator_catalog")
     elif accelerator == "tpu":
         machine_shape = machine_shape or "TpuV38"
         if machine_shape != "TpuV38":
@@ -253,6 +264,13 @@ def _download(path: str, destination_dir: str, fallback_name: str) -> dict[str, 
 
 
 def _call(name: str, arguments: dict[str, Any]) -> Any:
+    if name == "kcp_accelerator_catalog":
+        payload, _ = _request("/api/accelerators/catalog")
+        return _safe(payload)
+    if name == "kcp_competition_access":
+        account_id = urllib.parse.quote(arguments["account_id"], safe="")
+        payload, _ = _request(f"/api/accounts/{account_id}/competitions", timeout=45)
+        return _safe(payload)
     if name == "kcp_open_app":
         return _open_app()
     if name == "kcp_list_accounts":

@@ -19,6 +19,8 @@ result.
 - When changing, rebuilding, packaging, or troubleshooting the Control Plane
   desktop app/plugin, read
   [references/desktop-maintenance.md](references/desktop-maintenance.md).
+- For competition accelerators or Internet-disabled notebooks, read
+  [references/competition-offline.md](references/competition-offline.md).
 
 Do not load both references unless the task genuinely spans both modes.
 
@@ -36,7 +38,8 @@ Do not load both references unless the task genuinely spans both modes.
    prepared elsewhere, copy it into a new explicit subdirectory of the allowed
    `experiments` root, validate the staged copy, and submit that staged path.
    Do not overwrite an existing experiment bundle; use a versioned directory.
-4. For GPU jobs use exact shape `NvidiaTeslaT4`. Do not use the generic/default
+4. Default GPU shape is `NvidiaTeslaT4`. Advanced competition shapes require
+   the competition/offline workflow linked above. Do not use the generic/default
    P100 path: the current PyTorch image lacks Pascal `sm_60` kernels. For TPU
    use `TpuV38`; omit shape for CPU.
 5. Require clear authorization immediately before submit, cancel, or retry.
