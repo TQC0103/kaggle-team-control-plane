@@ -11,7 +11,7 @@ import {
 } from "react";
 
 type AccountState = "ready" | "running" | "cooldown" | "blocked" | "offline";
-type RunState = "queued" | "submitting" | "running" | "succeeded" | "failed" | "cancelled";
+type RunState = "queued" | "submitting" | "running" | "cancel_requested" | "succeeded" | "failed" | "cancelled";
 type ConnectionState = "checking" | "live" | "partial" | "offline";
 
 type BuildInfo = {
@@ -66,6 +66,7 @@ type Run = {
   resultSummary?: string;
   remoteMayBeRunning?: boolean;
   cancelSemantics?: string;
+  kernelSlug?: string;
   logs: string[];
   logBeforeId?: number;
   hasOlderLogs?: boolean;
@@ -234,6 +235,7 @@ function normalizeStatus(value: string): RunState {
   if (["error", "failed", "failure"].includes(status)) return "failed";
   if (["cancelled", "canceled", "aborted"].includes(status)) return "cancelled";
   if (status === "submitting") return "submitting";
+  if (status === "cancel_requested") return "cancel_requested";
   if (["pending", "submitted", "queued"].includes(status)) return "queued";
   return "running";
 }
@@ -367,6 +369,7 @@ function normalizeRun(value: unknown, index: number, accounts: Account[]): Run {
     resultSummary,
     remoteMayBeRunning: raw.remote_may_be_running === true,
     cancelSemantics: textValue(raw, ["cancel_semantics"], "") || undefined,
+    kernelSlug: textValue(raw, ["kernel_slug"], "") || undefined,
     logs,
     logBeforeId: remoteLogs.length
       ? numberValue(raw, ["remote_logs_before_id"], 0) || remoteLogValue.reduce<number | undefined>((minimum, item) => {
@@ -471,7 +474,7 @@ function StatusBadge({ status }: { status: RunState }) {
   return (
     <span className={`status-badge status-${status}`}>
       <span className="status-dot" aria-hidden="true" />
-      {status === "submitting" ? "Verifying submission" : status}
+      {status === "submitting" ? "Verifying submission" : status === "cancel_requested" ? "Cancel pending" : status}
     </span>
   );
 }
@@ -572,7 +575,7 @@ export default function Home() {
       const nextRuns = list.map((item, index) => normalizeRun(item, index, nextAccounts));
       setRuns(nextRuns);
       nextAccounts = nextAccounts.map((account) => {
-        const activeRuns = nextRuns.filter((run) => run.accountId === account.id && ["running", "queued", "submitting"].includes(run.status)).length;
+        const activeRuns = nextRuns.filter((run) => run.accountId === account.id && ["running", "queued", "submitting", "cancel_requested"].includes(run.status)).length;
         const state: AccountState = account.controlState !== "enabled" || account.credentialAvailable === false
           ? "offline"
           : (account.remoteActiveRuns || 0) > 0 || activeRuns > 0
@@ -728,7 +731,7 @@ export default function Home() {
     document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
 
-  const runAction = async (run: Run, action: "cancel" | "retry" | "result") => {
+  const runAction = async (run: Run, action: "cancel" | "retry" | "result", kernelSessionId?: number) => {
     if (connection !== "live") {
       setToast(`API offline — ${action} was not sent for ${run.name}.`);
       return;
@@ -736,6 +739,7 @@ export default function Home() {
     try {
       const data = await apiRequest(`/api/jobs/${encodeURIComponent(run.id)}/${action}`, {
         method: action === "result" ? "GET" : "POST",
+        ...(action === "cancel" && kernelSessionId ? { body: JSON.stringify({ kernel_session_id: kernelSessionId, session_ref: run.kernelSlug }) } : {}),
       });
       if (action === "result" && data && typeof data === "object") {
         const record = data as Record<string, unknown>;
@@ -754,9 +758,13 @@ export default function Home() {
         const remoteMayBeRunning = rawJob.remote_may_be_running === true || record.remote_may_be_running === true;
         const cancelledRun = normalizeRun({ ...run, ...rawJob, logs: undefined, cancel_semantics: semantics }, 0, accounts);
         setSelectedRun({ ...run, ...cancelledRun, owner: run.owner, username: run.username });
-        setToast(remoteMayBeRunning || semantics === "local_monitor_stop_requested"
-          ? `Warning: local monitoring stopped for ${run.name}, but its Kaggle kernel may still be running. Reconcile the account before assigning new work.`
-          : `${run.name}: queued job cancelled before remote execution.`);
+        setToast(semantics === "remote_cancellation_confirmed"
+          ? `${run.name}: cancellation confirmed by Kaggle.`
+          : semantics === "queued_job_cancelled"
+            ? `${run.name}: cancelled before submission to Kaggle.`
+            : textValue(record, ["message"], remoteMayBeRunning
+              ? `${run.name}: cancellation is unconfirmed; the Kaggle session may still run.`
+              : `${run.name}: cancellation requested, awaiting remote confirmation.`));
       } else if (action === "result") {
         setToast(`${run.name}: result details loaded in this drawer.`);
       } else {
@@ -1656,7 +1664,7 @@ function RunDrawer({ run, connection, onClose, onAction, onRefresh }: {
   run: Run;
   connection: ConnectionState;
   onClose: () => void;
-  onAction: (run: Run, action: "cancel" | "retry" | "result") => void;
+  onAction: (run: Run, action: "cancel" | "retry" | "result", kernelSessionId?: number) => void;
   onRefresh: () => void;
 }) {
   const [olderLogs, setOlderLogs] = useState<string[]>([]);
@@ -1665,6 +1673,7 @@ function RunDrawer({ run, connection, onClose, onAction, onRefresh }: {
   const [loadingOlderLogs, setLoadingOlderLogs] = useState(false);
   const [downloading, setDownloading] = useState<"logs" | "result" | null>(null);
   const [downloadError, setDownloadError] = useState("");
+  const [cancelSessionId, setCancelSessionId] = useState("");
   const logs = [...olderLogs, ...run.logs];
 
   const loadOlderLogs = async () => {
@@ -1751,7 +1760,7 @@ function RunDrawer({ run, connection, onClose, onAction, onRefresh }: {
         {run.remoteMayBeRunning && (
           <div className="remote-warning" role="alert">
             <strong>Kaggle may still be running this kernel</strong>
-            <span>{run.cancelSemantics === "local_monitor_stop_requested" ? "Cancel stopped the local monitor only." : "The remote state could not be confirmed."} Check Kaggle, then reconcile the assigned account before sending it more work.</span>
+            <span>{run.cancelSemantics === "remote_cancellation_requires_session_id" ? "Remote cancellation needs the actual session ID; the notebook is still queued or running." : "Remote cancellation is not confirmed."} The account stays reserved until Kaggle confirms a terminal state.</span>
           </div>
         )}
         <dl className="run-facts">
@@ -1778,7 +1787,10 @@ function RunDrawer({ run, connection, onClose, onAction, onRefresh }: {
         <section className="log-panel" aria-labelledby="log-title"><header><h3 id="log-title">Live output</h3><div><span>Kaggle sync ≤30s · {logs.length} lines shown</span><button type="button" onClick={onRefresh} disabled={connection !== "live"}>Refresh</button></div></header>{hasOlderLogs && <div className="log-load-actions"><button type="button" className="load-more-logs load-older-logs" disabled={loadingOlderLogs} onClick={() => void loadOlderLogs()}>{loadingOlderLogs ? "Loading…" : "Load 500 earlier lines"}</button><button type="button" className="load-more-logs load-older-logs" disabled={loadingOlderLogs} onClick={() => void loadAllOlderLogs()}>{loadingOlderLogs ? "Loading…" : "Load all earlier lines"}</button></div>}<pre>{logs.map((line, index) => <code key={`${line}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span>{line}</code>)}</pre></section>
         {downloadError && <p className="drawer-download-error" role="alert">{downloadError}</p>}
         <footer className="drawer-actions">
-          {["running", "queued", "submitting"].includes(run.status) && <button className="button button-danger" onClick={() => onAction(run, "cancel")}>Cancel run</button>}
+          {["running", "queued", "submitting", "cancel_requested"].includes(run.status) && <>
+            <label>Kernel session ID (optional)<input aria-label="Kernel session ID" inputMode="numeric" value={cancelSessionId} onChange={(event) => setCancelSessionId(event.target.value)} placeholder="Actual session ID, not notebook ID or version" /></label>
+            <button className="button button-danger" disabled={Boolean(cancelSessionId) && (!/^\d+$/.test(cancelSessionId) || !Number.isSafeInteger(Number(cancelSessionId)) || Number(cancelSessionId) <= 0)} onClick={() => onAction(run, "cancel", cancelSessionId ? Number(cancelSessionId) : undefined)}>Cancel on Kaggle</button>
+          </>}
           {(run.status === "failed" || run.status === "cancelled") && <button className="button button-primary" onClick={() => onAction(run, "retry")}>Retry run</button>}
           {run.status === "succeeded" && <button className="button button-primary" onClick={() => onAction(run, "result")}>Get results</button>}
           <button className="button button-quiet" disabled={downloading !== null || connection !== "live"} onClick={() => void download("logs")}>{downloading === "logs" ? "Preparing logs…" : "Download logs"}</button>

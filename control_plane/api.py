@@ -301,7 +301,7 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             return 200, service.remote_job_status(match.group(1))
         match = re.fullmatch(r"/api/jobs/([^/]+)/cancel", path)
         if match and method == "POST":
-            return 202, service.cancel_job(match.group(1), actor)
+            return 202, service.cancel_job(match.group(1), actor, body)
         match = re.fullmatch(r"/api/jobs/([^/]+)/retry", path)
         if match and method == "POST":
             return 202, {"job": service.retry_job(match.group(1), actor)}

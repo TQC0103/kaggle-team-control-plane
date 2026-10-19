@@ -55,6 +55,18 @@ Do not load both references unless the task genuinely spans both modes.
 8. Report account ID, shape, source directory, kernel slug, job ID, final state,
    and artifact location. Omit usernames unless requested.
 
+### Cancellation identity and confirmation
+
+Remote cancellation requires the actual numeric `kernel_session_id` plus the
+job's exact `session_ref` (`owner/slug`). The public status/GetKernel APIs do not
+provide this identity. Never substitute notebook ID, version number, or a guessed
+ID, delete the notebook, or push a replacement just to stop it. If identity is
+missing, report `remote_cancellation_requires_session_id` and keep the job/account
+reserved. A queued KCP job that has not been submitted can be cancelled locally.
+An accepted remote request is only `cancel_requested`; only Kaggle terminal-state
+verification permits `cancelled`. Do not replay an ambiguous cancellation after a
+timeout. The desktop Cancel action and `kcp_job_action` accept the explicit ID.
+
 When troubleshooting needs a handoff, prefer `kcp_download_support_bundle` to
 manual log/database collection. It contains allow-listed aggregate diagnostics
 and build identity, never credentials, usernames, paths, job logs, or artifacts.

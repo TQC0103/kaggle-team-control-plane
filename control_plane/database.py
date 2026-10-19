@@ -935,7 +935,7 @@ class Database:
                     "remote_may_be_running=1,updated_at=? WHERE id=?",
                     (now, job_id),
                 )
-                semantics = "local_monitor_stop_requested"
+                semantics = "remote_cancellation_pending"
             else:
                 raise ConflictError(f"job in state {job['status']!r} cannot be cancelled")
             self.append_audit(

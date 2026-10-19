@@ -726,6 +726,10 @@ class JobScheduler:
             remote_uncertain = bool(
                 current.get("remote_may_be_running") or submit_started
             )
+            if current.get("cancel_requested") and remote_uncertain:
+                self.database.transition_job(job_id, ACTIVE_JOB_STATES, "cancel_requested",
+                    fields={"remote_may_be_running": 1})
+                return
             self.database.transition_job(
                 job_id,
                 ACTIVE_JOB_STATES,
@@ -745,7 +749,7 @@ class JobScheduler:
                 self.database.transition_job(
                     job_id,
                     {"cancel_requested"},
-                    "cancelled",
+                    "cancel_requested",
                     fields={
                         "error": "local monitor stopped; remote execution may continue",
                         "remote_may_be_running": 1,

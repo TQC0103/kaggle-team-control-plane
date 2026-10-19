@@ -110,12 +110,14 @@ class ToolRegistry:
             Tool(
                 "cancel_run",
                 (
-                    "Cancel a queued experiment or stop local monitoring of an active one. "
-                    "Kaggle may keep an active remote kernel running; in that case the account "
-                    "is blocked until a human verifies the remote run and reconciles it in the dashboard."
+                    "Cancel a locally queued experiment, or request remote Kaggle session cancellation. "
+                    "Remote cancellation requires its actual kernel_session_id and matching session_ref. "
+                    "Missing identity or an unconfirmed response keeps the job active; never infer cancellation."
                 ),
                 _object_schema(
-                    {"run_id": {"type": "string", "minLength": 1}},
+                    {"run_id": {"type": "string", "minLength": 1},
+                     "kernel_session_id": {"type": "integer", "minimum": 1},
+                     "session_ref": {"type": "string", "minLength": 3}},
                     required=["run_id"],
                 ),
                 self._cancel_run,
@@ -197,7 +199,7 @@ class ToolRegistry:
         return self.client.request(
             "POST",
             f"/api/jobs/{_path_id(run_id)}/cancel",
-            body={},
+            body=_pick(args, "kernel_session_id", "session_ref"),
         )
 
     def _retry_run(self, args: dict[str, Any]) -> Any:

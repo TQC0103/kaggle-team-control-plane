@@ -114,6 +114,7 @@ class ControlPlaneService:
         # queue does not flood the event history with identical polls.
         self._recovery_observations: dict[str, str] = {}
         self._recovery_observations_lock = threading.Lock()
+        self._cancel_lock = threading.Lock()
         recovered_job_ids = self.database.recover_interrupted_jobs()
         self.recovered_jobs = len(recovered_job_ids)
         self.scheduler = JobScheduler(
@@ -247,7 +248,7 @@ class ControlPlaneService:
                     self.database.transition_job(
                         job_id,
                         active_states,
-                        "running",
+                        "cancel_requested" if job.get("cancel_requested") else "running",
                         fields={"error": None, "remote_may_be_running": 1},
                     )
                     self._schedule_recovered_job_recheck(job_id)
@@ -367,6 +368,12 @@ class ControlPlaneService:
                         job_id, job["kernel_slug"], env, terminal_log_lines
                     )
                 elif remote.state == "cancelled":
+                    terminal_result = dict(job.get("result") or {})
+                    terminal_result.update(recovered_after_restart=True, remote_status=safe_detail)
+                    if job.get("cancel_requested"):
+                        cancellation = dict(terminal_result.get("cancellation") or {})
+                        cancellation.update(semantics="remote_cancellation_confirmed", message="Cancellation confirmed by Kaggle.")
+                        terminal_result["cancellation"] = cancellation
                     self.database.transition_job(
                         job_id,
                         active_states,
@@ -374,10 +381,7 @@ class ControlPlaneService:
                         fields={
                             "error": safe_detail or "Kaggle reported cancellation",
                             "remote_may_be_running": 0,
-                            "result": {
-                                "recovered_after_restart": True,
-                                "remote_status": safe_detail,
-                            },
+                            "result": terminal_result,
                         },
                     )
                 # Kaggle may briefly report queued. ``submitted`` remains the
@@ -386,7 +390,7 @@ class ControlPlaneService:
                     self.database.transition_job(
                         job_id,
                         active_states,
-                        "submitted",
+                        "cancel_requested" if job.get("cancel_requested") else "submitted",
                         fields={"error": None, "remote_may_be_running": 1},
                     )
                     self._schedule_recovered_job_recheck(job_id)
@@ -426,6 +430,8 @@ class ControlPlaneService:
         decorated["machine_shape"] = metadata.get("machine_shape")
 
         result = decorated.get("result")
+        cancellation = result.get("cancellation", {}) if isinstance(result, dict) else {}
+        decorated["cancel_semantics"] = cancellation.get("semantics", "")
         output = result.get("output") if isinstance(result, dict) else None
         runtime = output.get("runtime") if isinstance(output, dict) else None
         decorated["runtime"] = runtime if isinstance(runtime, dict) else None
@@ -1068,15 +1074,62 @@ class ControlPlaneService:
                 )
         return result
 
-    def cancel_job(self, job_id: str, actor: str) -> dict[str, Any]:
-        job, semantics = self.database.request_cancel(job_id, actor)
-        self.scheduler.request_cancel(job_id)
-        if semantics == "local_monitor_stop_requested":
-            # Kaggle's public CLI cannot stop a submitted kernel by slug.  Do
-            # not make the operator clear a guard by hand: keep checking the
-            # remote job until Kaggle itself reports a terminal state.
+    def cancel_job(self, job_id: str, actor: str, payload=None) -> dict[str, Any]:
+        from .remote_cancel import cancellation_identity
+        payload = {} if payload is None else payload
+        with self._cancel_lock:
+            original = self.database.get_job(job_id)
+            cancellation_identity(original, payload)  # validate before changing state
+            previous = (original.get("result") or {}).get("cancellation", {})
+            if previous.get("request_started"):
+                return {"job": self._decorate_job(original), "cancel_semantics": previous["semantics"],
+                        "message": "Cancellation was already requested; checking status without sending it again."}
+            job, semantics = self.database.request_cancel(job_id, actor)
+            if semantics == "queued_job_cancelled":
+                self.scheduler.request_cancel(job_id)
+                return {"job": self._decorate_job(job), "cancel_semantics": semantics}
+            account = self.database.get_account(job["account_id"])
+            config = self.scheduler.config_root / ("cancel-" + job_id)
+            config.mkdir(parents=True, exist_ok=True)
+            env = self.vault.build_subprocess_env(account["credential_env_ref"], account["kaggle_username"], config)
+            result = dict(job.get("result") or {})
+            cancel_method = getattr(self.adapter, "cancel", None)
+            record = {"semantics": "remote_cancellation_pending", "request_started": False, "request_sent": False}
+            try:
+                if cancel_method is None:
+                    record.update(semantics="remote_cancellation_unavailable", message="Adapter cannot cancel remotely; Kaggle session is still unconfirmed.")
+                else:
+                    # Persist identity/intent BEFORE mutation, even if the
+                    # response is lost or the desktop restarts during it.
+                    if cancellation_identity(job, payload) is not None:
+                        record["request_started"] = True
+                        record.update(kernel_session_id=cancellation_identity(job, payload), session_ref=job["kernel_slug"])
+                        result["cancellation"] = dict(record)
+                        self.database.transition_job(job_id, {"cancel_requested"}, "cancel_requested", fields={"result": result})
+                    record.update(cancel_method(job, env, payload))
+            except Exception as exc:
+                record.update(semantics="remote_cancellation_unconfirmed", message=self.scheduler._redact(str(exc), env)[:1500])
+            result["cancellation"] = record
+            self.database.transition_job(job_id, {"cancel_requested"}, "cancel_requested",
+                                         fields={"result": result, "remote_may_be_running": 1})
+            # Stop the local subprocess, while preserving a NONTERMINAL state.
+            # The independent read-only reconciler verifies what Kaggle did.
+            self.scheduler.request_cancel(job_id)
+            if record.get("request_sent"):
+                try:
+                    remote = self.adapter.status(job, env, threading.Event())
+                    if remote.state == "cancelled":
+                        record["semantics"] = "remote_cancellation_confirmed"
+                        record["message"] = "Cancellation confirmed by Kaggle."
+                        self.database.transition_job(job_id, {"cancel_requested"}, "cancelled",
+                            fields={"result": result, "remote_may_be_running": 0, "error": None})
+                except Exception as exc:
+                    record["verification_error"] = self.scheduler._redact(str(exc), env)[:1000]
+            self.database.append_job_event(job_id, "Remote cancellation: " + record["semantics"],
+                details=record, level="info" if record["semantics"] == "remote_cancellation_confirmed" else "warning")
             self._schedule_recovered_job_recheck(job_id)
-        return {"job": self._decorate_job(job), "cancel_semantics": semantics}
+            return {"job": self._decorate_job(self.database.get_job(job_id)), "cancel_semantics": record["semantics"],
+                    "message": record.get("message", "Remote cancellation is pending verification.")}
 
     def retry_job(self, job_id: str, actor: str) -> dict[str, Any]:
         original = self.database.get_job(job_id)

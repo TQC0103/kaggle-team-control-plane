@@ -259,6 +259,12 @@ class KaggleCliAdapter:
         self.live_log_capture_seconds = max(0.1, live_log_capture_seconds)
         self.auth_env_refresh = auth_env_refresh
 
+    def cancel(self, job, env, payload):
+        from .remote_cancel import cancel_session
+        if self.auth_env_refresh:
+            self.auth_env_refresh(env, False)
+        return cancel_session(job, env, payload)
+
     @staticmethod
     def _auth_failure(exc: Exception) -> bool:
         message = str(exc).lower()
@@ -598,6 +604,10 @@ class KaggleCliAdapter:
                  "cancel_requested": "running", "cancel_acknowledged": "cancelled"}.get(
             match.group(1).lower(), match.group(1).lower()
         )
+        if state == "failed" and job.get("cancel_requested") and re.search(
+            r'Failure message:\s*["\']?(?:User\s+)?cancel(?:led|ed)(?:\s+by\s+(?:the\s+)?user)?[.!"\'\s]*$', output, re.IGNORECASE
+        ):
+            state = "cancelled"
         return RemoteStatus(state, output[-2000:])
 
     def output(

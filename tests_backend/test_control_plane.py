@@ -1338,7 +1338,7 @@ class SchedulerTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_cancel_running_stops_local_monitor_and_retry_keeps_account(self) -> None:
+    def test_cancel_without_remote_adapter_keeps_pending_and_blocks_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = make_source(root, "source")
@@ -1375,9 +1375,9 @@ class SchedulerTests(unittest.TestCase):
                 wait_for_status(service, job_id, {"running"})
                 cancellation = service.cancel_job(job_id, "tester")
                 self.assertEqual(
-                    cancellation["cancel_semantics"], "local_monitor_stop_requested"
+                    cancellation["cancel_semantics"], "remote_cancellation_unavailable"
                 )
-                cancelled = wait_for_status(service, job_id, {"cancelled"})
+                cancelled = wait_for_status(service, job_id, {"cancel_requested"})
                 self.assertTrue(cancelled["remote_may_be_running"])
                 blocked_account = service.get_account(account["id"])
                 self.assertTrue(blocked_account["remote_reconciliation_required"])
@@ -1402,6 +1402,10 @@ class SchedulerTests(unittest.TestCase):
                     service.reconcile_account(
                         account["id"], {"confirmed": False}, "tester"
                     )
+                # A separately verified remote terminal state is required;
+                # stopping a local monitor must not create that evidence.
+                service.database.transition_job(job_id, {"cancel_requested"}, "cancelled",
+                    fields={"remote_may_be_running": 1})
                 reconciled = service.reconcile_account(
                     account["id"],
                     {"confirmed": True, "note": "Verified stopped on Kaggle"},

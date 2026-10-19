@@ -119,11 +119,13 @@ TOOLS = [
     },
     {
         "name": "kcp_job_action",
-        "description": "Cancel, retry, or request result metadata for one job. Cancel and retry change remote state.",
+        "description": "Cancel a local queued job or request remote cancellation using its actual kernel session ID. A missing ID or unconfirmed response is not a remote cancellation. Retry creates a new job.",
         "inputSchema": _schema(
             {
                 "job_id": {"type": "string", "minLength": 1},
                 "action": {"type": "string", "enum": ["cancel", "retry", "result"]},
+                "kernel_session_id": {"type": "integer", "minimum": 1},
+                "session_ref": {"type": "string", "minLength": 3},
             },
             ["job_id", "action"],
         ),
@@ -318,7 +320,8 @@ def _call(name: str, arguments: dict[str, Any]) -> Any:
         job_id = urllib.parse.quote(arguments["job_id"], safe="")
         action = arguments["action"]
         method = "GET" if action == "result" else "POST"
-        payload, _ = _request(f"/api/jobs/{job_id}/{action}", method, timeout=30)
+        body = {key: arguments[key] for key in ("kernel_session_id", "session_ref") if key in arguments} if action == "cancel" else None
+        payload, _ = _request(f"/api/jobs/{job_id}/{action}", method, body, timeout=55)
         return _safe(payload)
     if name == "kcp_job_events":
         job_id = urllib.parse.quote(arguments["job_id"], safe="")
