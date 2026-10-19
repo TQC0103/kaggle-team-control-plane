@@ -1788,7 +1788,7 @@ function RunDrawer({ run, connection, onClose, onAction, onRefresh }: {
         {downloadError && <p className="drawer-download-error" role="alert">{downloadError}</p>}
         <footer className="drawer-actions">
           {["running", "queued", "submitting", "cancel_requested"].includes(run.status) && <>
-            <label>Kernel session ID (optional)<input aria-label="Kernel session ID" inputMode="numeric" value={cancelSessionId} onChange={(event) => setCancelSessionId(event.target.value)} placeholder="Actual session ID, not notebook ID or version" /></label>
+            <label>Session ID override (optional)<input aria-label="Kernel session ID" inputMode="numeric" value={cancelSessionId} onChange={(event) => setCancelSessionId(event.target.value)} placeholder="Leave blank: KCP resolves automatically" /></label>
             <button className="button button-danger" disabled={Boolean(cancelSessionId) && (!/^\d+$/.test(cancelSessionId) || !Number.isSafeInteger(Number(cancelSessionId)) || Number(cancelSessionId) <= 0)} onClick={() => onAction(run, "cancel", cancelSessionId ? Number(cancelSessionId) : undefined)}>Cancel on Kaggle</button>
           </>}
           {(run.status === "failed" || run.status === "cancelled") && <button className="button button-primary" onClick={() => onAction(run, "retry")}>Retry run</button>}

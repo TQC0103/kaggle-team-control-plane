@@ -265,6 +265,12 @@ class KaggleCliAdapter:
             self.auth_env_refresh(env, False)
         return cancel_session(job, env, payload)
 
+    def resolve_cancel_identity(self, job, env):
+        from .remote_cancel import resolve_session_identity
+        if self.auth_env_refresh:
+            self.auth_env_refresh(env, False)
+        return resolve_session_identity(job, env)
+
     @staticmethod
     def _auth_failure(exc: Exception) -> bool:
         message = str(exc).lower()
@@ -581,13 +587,22 @@ class KaggleCliAdapter:
                     f"{expected_owner}/{expected_slug}. Verify that the credential belongs "
                     "to the registered Kaggle username and retry with a new kernel slug."
                 )
-        return {"kernel_slug": job["kernel_slug"], "cli_message": output[-2000:]}
+        result = {"kernel_slug": job["kernel_slug"], "cli_message": output[-2000:]}
+        version = re.search(r"\bKernel version (\d+) successfully pushed\b", output, re.IGNORECASE)
+        if version:
+            result["version_number"] = int(version.group(1))
+        return result
 
     def status(
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> RemoteStatus:
+        status_ref = job["kernel_slug"]
+        cancellation = (job.get("result") or {}).get("cancellation") or {}
+        resolution = cancellation.get("resolution") or {}
+        if job.get("cancel_requested") and resolution.get("version_number"):
+            status_ref += "/" + str(resolution["version_number"])
         output = self._run(
-            ["kernels", "status", job["kernel_slug"]],
+            ["kernels", "status", status_ref],
             env,
             cancel_event,
             timeout_seconds=20,

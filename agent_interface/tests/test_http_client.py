@@ -24,6 +24,14 @@ class FakeResponse:
 
 class ApiClientTests(unittest.TestCase):
     @patch("agent_interface.http_client.urlopen")
+    def test_per_call_timeout_does_not_mutate_client_default(self, mocked_open):
+        mocked_open.return_value=FakeResponse()
+        client=ApiClient("http://127.0.0.1:8765",timeout=4)
+        client.request("POST","/api/jobs/job/cancel",body={},timeout=100)
+        self.assertEqual(mocked_open.call_args.kwargs['timeout'],100)
+        self.assertEqual(client.timeout,4)
+
+    @patch("agent_interface.http_client.urlopen")
     def test_request_encodes_query_body_and_auth(self, mocked_open):
         mocked_open.return_value = FakeResponse()
         client = ApiClient("http://127.0.0.1:8765/", "secret", timeout=4)

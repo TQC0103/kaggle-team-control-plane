@@ -1,7 +1,7 @@
 """CLI for the updated KCP remote-cancellation API; never reads credentials.
 
 python -m desktop_app.cancel_remote_job JOB_ID --session-id ID --session-ref OWNER/SLUG
-Omit the optional ID only to request cancellation and inspect missing identity.
+Omit the optional ID for automatic owner/slug/version redirect resolution.
 """
 import argparse
 import json
@@ -18,7 +18,7 @@ def main():
     body = {} if args.session_id is None else {'kernel_session_id':args.session_id, 'session_ref':args.session_ref}
     req = Request('http://127.0.0.1:8765/api/jobs/'+args.job_id+'/cancel',
                   data=json.dumps(body).encode(), headers={'Content-Type':'application/json'}, method='POST')
-    with urlopen(req, timeout=55) as response:
+    with urlopen(req, timeout=100) as response:
         data=json.load(response)
     print(json.dumps({'job_id':args.job_id, 'status':data['job']['status'],
                       'cancel_semantics':data['cancel_semantics'], 'message':data.get('message')}))

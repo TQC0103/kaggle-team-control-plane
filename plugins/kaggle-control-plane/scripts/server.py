@@ -119,7 +119,7 @@ TOOLS = [
     },
     {
         "name": "kcp_job_action",
-        "description": "Cancel a local queued job or request remote cancellation using its actual kernel session ID. A missing ID or unconfirmed response is not a remote cancellation. Retry creates a new job.",
+        "description": "Cancel a local queued job or resolve and cancel its remote Kaggle session automatically from the original owner/slug/version. Optional explicit session ID is supported. An unconfirmed response is not a completed cancellation. Retry creates a new job.",
         "inputSchema": _schema(
             {
                 "job_id": {"type": "string", "minLength": 1},
@@ -321,7 +321,7 @@ def _call(name: str, arguments: dict[str, Any]) -> Any:
         action = arguments["action"]
         method = "GET" if action == "result" else "POST"
         body = {key: arguments[key] for key in ("kernel_session_id", "session_ref") if key in arguments} if action == "cancel" else None
-        payload, _ = _request(f"/api/jobs/{job_id}/{action}", method, body, timeout=55)
+        payload, _ = _request(f"/api/jobs/{job_id}/{action}", method, body, timeout=100 if action == "cancel" else 55)
         return _safe(payload)
     if name == "kcp_job_events":
         job_id = urllib.parse.quote(arguments["job_id"], safe="")

@@ -1099,6 +1099,13 @@ class ControlPlaneService:
                 if cancel_method is None:
                     record.update(semantics="remote_cancellation_unavailable", message="Adapter cannot cancel remotely; Kaggle session is still unconfirmed.")
                 else:
+                    if cancellation_identity(job, payload) is None:
+                        resolver = getattr(self.adapter, "resolve_cancel_identity", None)
+                        if resolver is not None:
+                            resolution = resolver(job, env)
+                            payload = {key:resolution[key] for key in ("kernel_session_id","session_ref")}
+                            cancellation_identity(job, payload)
+                            record["resolution"] = resolution
                     # Persist identity/intent BEFORE mutation, even if the
                     # response is lost or the desktop restarts during it.
                     if cancellation_identity(job, payload) is not None:
@@ -1117,7 +1124,7 @@ class ControlPlaneService:
             self.scheduler.request_cancel(job_id)
             if record.get("request_sent"):
                 try:
-                    remote = self.adapter.status(job, env, threading.Event())
+                    remote = self.adapter.status(dict(job, result=result), env, threading.Event())
                     if remote.state == "cancelled":
                         record["semantics"] = "remote_cancellation_confirmed"
                         record["message"] = "Cancellation confirmed by Kaggle."

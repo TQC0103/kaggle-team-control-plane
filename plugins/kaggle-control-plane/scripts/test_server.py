@@ -32,7 +32,7 @@ def test_redaction() -> None:
 def test_cancellation_passes_explicit_session_identity() -> None:
     with mock.patch.object(SERVER, "_request", return_value=({"cancel_semantics": "remote_cancellation_pending"}, {})) as request:
         SERVER._call("kcp_job_action", {"job_id": "job-1", "action": "cancel", "kernel_session_id": 999, "session_ref": "owner/experiment"})
-        request.assert_called_once_with("/api/jobs/job-1/cancel", "POST", {"kernel_session_id": 999, "session_ref": "owner/experiment"}, timeout=55)
+        request.assert_called_once_with("/api/jobs/job-1/cancel", "POST", {"kernel_session_id": 999, "session_ref": "owner/experiment"}, timeout=100)
 
 
 def test_competition_discovery_only_uses_get() -> None:

@@ -10,7 +10,8 @@ class FakeClient:
     def __init__(self):
         self.calls = []
 
-    def request(self, method, path, *, query=None, body=None):
+    def request(self, method, path, *, query=None, body=None, timeout=None):
+        self.last_timeout = timeout
         self.calls.append((method, path, query, body))
         return {"method": method, "path": path}
 
@@ -113,6 +114,7 @@ class ToolTests(unittest.TestCase):
 
     def test_run_id_is_path_encoded(self):
         self.registry.call("cancel_run", {"run_id": "run/one"})
+        self.assertEqual(self.client.last_timeout, 100)
         self.assertEqual(
             self.client.calls[0],
             ("POST", "/api/jobs/run%2Fone/cancel", None, {}),

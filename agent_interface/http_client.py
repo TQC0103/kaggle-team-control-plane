@@ -65,6 +65,7 @@ class ApiClient:
         *,
         query: Mapping[str, Any] | None = None,
         body: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         query_values = {
             key: _query_value(value)
@@ -85,7 +86,7 @@ class ApiClient:
 
         request = Request(url, data=data, headers=headers, method=method.upper())
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with urlopen(request, timeout=self.timeout if timeout is None else timeout) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
                 if len(raw) > MAX_RESPONSE_BYTES:
                     raise ApiError("Control-plane response exceeded 8 MiB")
@@ -100,7 +101,7 @@ class ApiClient:
         except URLError as exc:
             raise ApiError(f"Could not reach control plane at {self.base_url}: {exc.reason}") from None
         except TimeoutError:
-            raise ApiError(f"Control-plane request timed out after {self.timeout:g}s") from None
+            raise ApiError(f"Control-plane request timed out after {self.timeout if timeout is None else timeout:g}s") from None
 
 
 def _query_value(value: Any) -> str | int | float:

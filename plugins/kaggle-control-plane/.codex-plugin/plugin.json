@@ -1,6 +1,6 @@
 {
   "name": "kaggle-control-plane",
-  "version": "0.1.0+codex.20261019235000",
+  "version": "0.1.0+codex.20261020002000",
   "description": "Safely run, monitor, diagnose, and maintain Kaggle workloads through the local Kaggle Control Plane.",
   "author": {
     "name": "ASUS Local"

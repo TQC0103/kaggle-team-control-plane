@@ -57,12 +57,17 @@ Do not load both references unless the task genuinely spans both modes.
 
 ### Cancellation identity and confirmation
 
-Remote cancellation requires the actual numeric `kernel_session_id` plus the
-job's exact `session_ref` (`owner/slug`). The public status/GetKernel APIs do not
-provide this identity. Never substitute notebook ID, version number, or a guessed
-ID, delete the notebook, or push a replacement just to stop it. If identity is
-missing, report `remote_cancellation_requires_session_id` and keep the job/account
-reserved. A queued KCP job that has not been submitted can be cancelled locally.
+Normal Cancel automatically resolves the actual numeric `kernel_session_id`
+through the official output-download redirect for the job's exact owner/slug
+and version from its original push receipt. It validates the response's exact
+HTTPS host and session-specific download_zip path without downloading output.
+Status/GetKernel alone do not provide the ID. Explicit `kernel_session_id` plus
+matching `session_ref` remains available. Never substitute notebook ID, version
+number, or guessed ID, delete the notebook, or push a replacement to stop it.
+If the saved version changed, receipt/redirect is missing, or resolution fails,
+keep the job/account reserved and report the failure. Do not ask the user for
+an ID before attempting KCP's automatic resolver. A KCP job not yet submitted
+can be cancelled locally.
 An accepted remote request is only `cancel_requested`; only Kaggle terminal-state
 verification permits `cancelled`. Do not replay an ambiguous cancellation after a
 timeout. The desktop Cancel action and `kcp_job_action` accept the explicit ID.

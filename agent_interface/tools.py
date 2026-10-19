@@ -111,8 +111,9 @@ class ToolRegistry:
                 "cancel_run",
                 (
                     "Cancel a locally queued experiment, or request remote Kaggle session cancellation. "
-                    "Remote cancellation requires its actual kernel_session_id and matching session_ref. "
-                    "Missing identity or an unconfirmed response keeps the job active; never infer cancellation."
+                    "KCP resolves its actual session ID automatically from the original owner/slug/version; "
+                    "explicit kernel_session_id and session_ref are optional. "
+                    "Failed resolution or an unconfirmed response keeps the job active; never infer cancellation."
                 ),
                 _object_schema(
                     {"run_id": {"type": "string", "minLength": 1},
@@ -200,6 +201,7 @@ class ToolRegistry:
             "POST",
             f"/api/jobs/{_path_id(run_id)}/cancel",
             body=_pick(args, "kernel_session_id", "session_ref"),
+            timeout=100,
         )
 
     def _retry_run(self, args: dict[str, Any]) -> Any:
