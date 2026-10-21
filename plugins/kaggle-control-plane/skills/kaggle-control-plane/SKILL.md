@@ -80,6 +80,16 @@ Use the laptop for unit tests, formatting, schema validation, dataset parsing,
 and short smoke checks only. Use Control Plane for embeddings, batch model
 evaluation, training, and other GPU-heavy work.
 
+## Dataset inventory and archived results
+
+Use `kcp_dataset_library` to list the cached owned-dataset inventory across accounts, reported remote bytes, upload status, imported full-readback SHA-256 reports, local-copy eviction and deletion state. Use `kcp_sync_dataset_library` for an asynchronous remote refresh (optionally selected account IDs). It lists only datasets owned by the selected account; shared inputs must not be presented as owned. Account sync errors retain the previous cache and its error/time. Refreshing a table never uploads or deletes data.
+
+An upload/visibility success is not a checksum proof. `/api/datasets/library/verification` registers a full remote-readback report only when every name/byte size/SHA matches the recorded upload operation. Imported reports are labeled as reports; later observed dataset updates make the report stale. Archive runners should register before local eviction and update `local_evicted` after verified local cleanup. Keep the external restore index and receipts.
+
+Only call `kcp_delete_dataset` when the human explicitly authorizes deletion of that exact `owner/slug`; implementing the feature or listing datasets is not authorization to delete real data. Supply the owning account, exact `confirm_dataset_ref`, `confirm_delete=true` and an idempotency key. When a verified archive's local copy was removed, require explicit acknowledgement of losing that archived copy. Active job inputs and active upload/settings operations block deletion. Never delete as an inference or cancellation workaround.
+
+An accepted delete is pending. Only the exact owner lookup returning remote 404 confirms absence; 403, auth failures, timeouts and continued readability remain uncertain. After an uncertain response or app restart, use `kcp_check_dataset_deletion`; never replay the mutation automatically. Deleting remote data does not clean unrelated local files.
+
 ## Persistent chained benchmarks
 
 For a long benchmark that must continue across Kaggle runtimes, use a small

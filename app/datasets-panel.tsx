@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import DatasetLibrary from "./dataset-library";
 
 type Account = { id: string; username: string; controlState?: string; credentialAvailable?: boolean };
 type Selection = { selection_id: string; file_count: number; bytes: number; files: { name: string; bytes: number }[]; nested_folders_zipped?: boolean };
@@ -129,6 +130,7 @@ export default function DatasetsPanel({ accounts, desktopAvailable, request }: P
     </form>
     {error && <p className="dataset-error" role="alert">{error}</p>}
     {notice && <p className="dataset-notice" role="status">{notice}</p>}
+    <DatasetLibrary accounts={accounts} request={request} inspect={operation => { void inspect(undefined, operation); }} />
     {!operations.length ? <div className="empty-state"><strong>No dataset operations yet.</strong><span>Upload local files or inspect an existing dataset to manage visibility and readers.</span></div> : <div className="dataset-operations">
       {operations.map(o => <article className="dataset-operation" key={o.id}>
         <div><a href={`https://www.kaggle.com/datasets/${o.dataset_ref}`} target="_blank" rel="noreferrer">{o.dataset_ref} ↗</a><span>{o.kind === "upload" ? `${o.file_count} files · ${size(o.bytes)}` : "Settings update"} · {accounts.find(a => a.id === o.account_id)?.username || "Account unavailable"}</span><small>{new Date(o.created_at).toLocaleString()}</small></div>

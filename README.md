@@ -422,6 +422,18 @@ environment and are resolved just in time into a minimal child environment for
 the assigned Kaggle CLI subprocess. The launcher removes those named values
 before starting the dashboard so they are not inherited by Node/Vite.
 
+### Dataset inventory and research archives (desktop beta.9)
+
+The Datasets panel lists owned datasets across connected accounts, remote sizes, visibility when inspected, account sync/errors, upload operations, imported SHA-256 readback reports, and whether an archive's local copy was removed. Search, account filtering and size/date sorting use the cached inventory; **Sync Kaggle inventory** performs an asynchronous remote scan with two workers and pagination. Shared inputs are not claimed as owned. Failed account refreshes retain the previous inventory and show the error.
+
+Dataset deletion requires the exact owning account, typing `owner/slug`, and an explicit confirmation. A locally evicted archive requires acknowledgement that the archived copy is being removed. Active job inputs and active upload/settings operations block deletion; new jobs/retries cannot race a pending or unresolved deletion. The official `kaggle datasets delete owner/slug --yes` command is issued once. Only an owner metadata lookup returning 404 marks deletion confirmed; 403/auth/network errors stay uncertain and expose a read-only status check. No real dataset is deleted by tests or installation.
+
+Inventory API: `GET /api/datasets/library`, `POST /api/datasets/library/refresh`. Archive runners register `POST /api/datasets/library/verification` with `account_id`, `dataset_ref`, original upload `operation_id`, `method=full_remote_readback`, `private_verified=true`, full `files=[{name,bytes,sha256}]`, and `local_evicted`. Every reported hash/size must match the uploaded manifest. Register before eviction and update after verified eviction; upload success alone is not checksum verification. Observed remote updates invalidate an older report. These are imported readback reports, not an independent server readback service.
+
+Delete API: `POST /api/datasets/library/delete` with an idempotency key and exact confirmation; `POST /api/datasets/library/deletion-status` is read-only reconciliation. The MCP plugin exposes the corresponding inventory, sync, delete and reconciliation tools. Remote deletion is never inferred from a timeout or automatically replayed after restart.
+
+The cache lives under KCP runtime storage, separate from credentials and uploaded data. Deleting a remote dataset does not delete unrelated local files or restore the space already moved off the laptop.
+
 ## Verification
 
 ```powershell

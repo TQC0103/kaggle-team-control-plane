@@ -31,6 +31,7 @@ from .errors import ConflictError, ValidationError
 from .scheduler import JobScheduler
 from .version import build_identity
 from .datasets import DatasetManager
+from .dataset_library import DatasetLibrary
 from .execution_profiles import GPU_SHAPES, validate_profile
 
 
@@ -108,6 +109,7 @@ class ControlPlaneService:
                 raise ValidationError("adapter_name must be fake or kaggle")
         self.adapter = adapter
         self.datasets = DatasetManager(self)
+        self.dataset_library = DatasetLibrary(self)
         self._recovery_stop = threading.Event()
         # Recovery keeps checking a remotely active kernel after a desktop
         # restart.  Retain its last observed state in memory so a long Kaggle
@@ -159,6 +161,7 @@ class ControlPlaneService:
     def close(self) -> None:
         self._recovery_stop.set()
         self.datasets.close()
+        self.dataset_library.close()
         self.scheduler.close()
 
     def _schedule_recovered_job_recheck(self, job_id: str) -> None:
@@ -863,14 +866,16 @@ class ControlPlaneService:
             {"name": name, "jobs": specs}, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         request_hash = hashlib.sha256(canonical_request).hexdigest()
-        batch = self.database.create_batch(
-            name,
-            specs,
-            actor,
-            self.artifact_root,
-            idempotency_key=idempotency_key,
-            request_hash=request_hash if idempotency_key else None,
-        )
+        with self.dataset_library._lock:
+            self.dataset_library.assert_job_inputs_available(specs)
+            batch = self.database.create_batch(
+                name,
+                specs,
+                actor,
+                self.artifact_root,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash if idempotency_key else None,
+            )
         self.scheduler.wake()
         return self._decorate_batch(batch)
 
@@ -1146,7 +1151,9 @@ class ControlPlaneService:
             accelerator=str(original.get("metadata", {}).get("accelerator", "cpu")),
             location="assigned account",
         )
-        retry = self.database.retry_job(job_id, actor, self.artifact_root)
+        with self.dataset_library._lock:
+            self.dataset_library.assert_job_inputs_available([original])
+            retry = self.database.retry_job(job_id, actor, self.artifact_root)
         self.scheduler.wake()
         return self._decorate_job(retry)
 

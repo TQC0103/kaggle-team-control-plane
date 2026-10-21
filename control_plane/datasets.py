@@ -175,6 +175,9 @@ class DatasetManager:
         with self._lock:
             if self._closed:
                 raise ConflictError("App is closing; try again after reopening")
+            library = getattr(self.service, 'dataset_library', None)
+            if library and library.blocks_mutation(account_id, metadata['id']):
+                raise ConflictError('Dataset deletion is in progress or unresolved; check its remote state first')
             previous = next((r for r in self._operations.values() if r["idempotency_key"] == key), None)
             # The same selection token remains valid on a client retry; persisted
             # retries are checked before accessing the in-memory selection.
@@ -225,6 +228,9 @@ class DatasetManager:
         directory = self.root / "inspections" / uuid.uuid4().hex
         try:
             remote = self._remote_metadata(run, ref, directory)
+            library = getattr(self.service, 'dataset_library', None)
+            if library:
+                library.record_metadata(payload.get('account_id'), ref, remote)
             # Return only UI metadata, never CLI environment or private configs.
             return {"dataset_ref": ref, "title": remote.get("title", ""), "description": remote.get("description", ""),
                     "is_private": remote.get("isPrivate"), "license": (remote.get("licenses") or [{"name": "other"}])[0]["name"],

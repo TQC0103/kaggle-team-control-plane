@@ -211,6 +211,16 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             return 200, entered_competitions(service, competition_access.group(1))
         if method == "GET" and path == "/api/datasets/operations":
             return 200, {"operations": service.datasets.list_operations()}
+        if method == 'GET' and path == '/api/datasets/library':
+            return 200, service.dataset_library.snapshot()
+        if method == 'POST' and path == '/api/datasets/library/refresh':
+            return 202, service.dataset_library.refresh(body)
+        if method == 'POST' and path == '/api/datasets/library/verification':
+            return 200, service.dataset_library.register_verification(body, actor)
+        if method == 'POST' and path == '/api/datasets/library/delete':
+            return 202, service.dataset_library.delete(body, actor)
+        if method == 'POST' and path == '/api/datasets/library/deletion-status':
+            return 200, service.dataset_library.reconcile(body)
         dataset_operation = re.fullmatch(r"/api/datasets/operations/([a-f0-9]{32})", path)
         if method == "GET" and dataset_operation:
             return 200, {"operation": service.datasets.get_operation(dataset_operation.group(1))}

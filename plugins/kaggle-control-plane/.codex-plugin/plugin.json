@@ -1,6 +1,6 @@
 {
   "name": "kaggle-control-plane",
-  "version": "0.1.0+codex.20261020002000",
+  "version": "0.1.0+codex.20261022020000",
   "description": "Safely run, monitor, diagnose, and maintain Kaggle workloads through the local Kaggle Control Plane.",
   "author": {
     "name": "ASUS Local"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Kaggle Control Plane",
     "shortDescription": "Run and diagnose Kaggle jobs safely.",
-    "longDescription": "Connects Codex to the local Kaggle Control Plane API for account and quota inspection, idempotent bounded batch submission, monitoring, cancellation, retry, artifact download, and safe support bundles. It also preserves local guidance for reproducible model benchmarks and desktop app maintenance. Kaggle credentials remain inside Control Plane.",
+    "longDescription": "Connects Codex to the local Kaggle Control Plane API for account and quota inspection, idempotent bounded batch submission, monitoring, cancellation, retry, artifact download, and safe support bundles. It also preserves local guidance for reproducible model benchmarks and desktop app maintenance. Kaggle credentials remain inside Control Plane. Lists owned datasets and archived results across accounts, records readback verification, and supports explicit owner-confirmed remote deletion.",
     "developerName": "ASUS Local",
     "category": "Developer Tools",
     "capabilities": [
@@ -21,7 +21,8 @@
       "Monitor my active Kaggle Control Plane jobs.",
       "Run this GPU benchmark through Control Plane.",
       "Diagnose this Kaggle benchmark log.",
-      "Troubleshoot the Kaggle Control Plane desktop app."
+      "Troubleshoot the Kaggle Control Plane desktop app.",
+      "List my Kaggle datasets and archived research results."
     ]
   },
   "mcpServers": "./.mcp.json"

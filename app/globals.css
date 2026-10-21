@@ -827,6 +827,39 @@ a:focus-visible {
 .dataset-reader-shortcuts .button { padding: 6px 9px; font-size: 9px; }
 .dataset-form-footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
 .dataset-remote-details { margin-top: 18px; font-size: 11px; }
+.dataset-library { margin: 24px 0; padding: 22px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface, #fff); }
+.dataset-library-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.dataset-library-heading h3 { margin: 0 0 6px; font-size: 19px; }
+.dataset-library-heading p, .dataset-library-note { color: var(--muted); font-size: 11px; line-height: 1.6; }
+.dataset-library-filters { display: flex; flex-wrap: wrap; gap: 12px; margin: 20px 0; }
+.dataset-library-filters label, .dataset-delete-confirm { display: flex; flex-direction: column; gap: 7px; font-size: 11px; }
+.dataset-library-filters select, .dataset-library-filters input, .dataset-delete-confirm input { padding: 10px 12px; border: 1px solid var(--line); border-radius: 5px; background: #fff; color: var(--ink); font: inherit; }
+.dataset-library-search { flex: 1; min-width: 180px; }
+.dataset-account-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin-bottom: 14px; }
+.dataset-account-summary > div { padding: 12px; border: 1px solid var(--line); border-radius: 5px; }
+.dataset-account-summary strong, .dataset-account-summary span, .dataset-account-summary small { display: block; font-size: 10px; margin: 3px 0; overflow-wrap: anywhere; }
+.dataset-account-summary small { color: var(--muted); }
+.dataset-library-scroll { overflow: auto; max-height: 620px; }
+.dataset-library-table { width: 100%; border-collapse: collapse; font-size: 11px; text-align: left; }
+.dataset-library-table th { white-space: nowrap; padding: 12px 10px; font-size: 10px; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--line); position: sticky; top: 0; background: #f8f8f3; }
+.dataset-library-table td { padding: 14px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.dataset-library-table td:first-child { min-width: 235px; max-width: 370px; overflow-wrap: anywhere; }
+.dataset-library-table td a { color: inherit; font-weight: 600; }
+.dataset-library-table small { display: block; font-size: 9px; color: var(--muted); margin-top: 5px; }
+.dataset-size { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.dataset-row-actions { display: flex; gap: 6px; }
+.dataset-row-actions .button { padding: 7px 10px; font-size: 10px; }
+.dataset-delete-button { color: #a2352e; background: #fff4f2; border: 1px solid #e7c9c5; }
+.dataset-delete-button:disabled { opacity: .45; cursor: not-allowed; }
+.dataset-verified { color: #346d47; font-size: 10px; }
+.dataset-unverified { color: var(--muted); }
+.dataset-delete-dialog { width: min(620px, 100%); }
+.dataset-delete-dialog .dataset-form { padding: 20px 26px 26px; }
+.dataset-delete-dialog p { font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.dataset-delete-confirm { margin: 20px 0; }
+.dataset-deletion-history { margin-top: 18px; font-size: 11px; }
+.dataset-deletion-history > div { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.dataset-deletion-history small { flex-basis: 100%; }
 @media (max-width: 700px) {
   .dataset-lookup { flex-direction: column; align-items: stretch; }
   .dataset-operation { grid-template-columns: minmax(0, 1fr); }

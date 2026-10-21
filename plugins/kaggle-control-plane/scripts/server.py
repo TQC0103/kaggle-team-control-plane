@@ -29,6 +29,30 @@ def _schema(properties: dict[str, Any] | None = None, required: list[str] | None
 
 TOOLS = [
     {
+        'name': 'kcp_dataset_library',
+        'description': 'List cached owned Kaggle datasets across accounts, sizes, upload/readback verification, local-copy removal and deletion states. No remote mutation.',
+        'inputSchema': _schema(),
+    },
+    {
+        'name': 'kcp_sync_dataset_library',
+        'description': 'Start bounded asynchronous owned-dataset inventory sync. Keeps prior inventory on account errors; never uploads or deletes.',
+        'inputSchema': _schema({'account_ids': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1, 'maxItems': 100}}),
+    },
+    {
+        'name': 'kcp_delete_dataset',
+        'description': 'Permanently delete one owned Kaggle dataset only after the human specifically authorizes its exact reference. Requires exact confirmation; blocks active dependencies and unresolved deletion. Never replay an uncertain delete.',
+        'inputSchema': _schema({
+            'account_id': {'type': 'string'}, 'dataset_ref': {'type': 'string'},
+            'confirm_dataset_ref': {'type': 'string'}, 'confirm_delete': {'type': 'boolean', 'const': True},
+            'acknowledge_archive_loss': {'type': 'boolean'}, 'idempotency_key': {'type': 'string', 'minLength': 8, 'maxLength': 120},
+        }, ['account_id', 'dataset_ref', 'confirm_dataset_ref', 'confirm_delete', 'idempotency_key']),
+    },
+    {
+        'name': 'kcp_check_dataset_deletion',
+        'description': 'Read-only reconciliation of a pending/uncertain dataset deletion. Does not send another delete. Only remote 404 confirms absence; 403/auth/network errors stay uncertain.',
+        'inputSchema': _schema({'deletion_id': {'type': 'string'}}, ['deletion_id']),
+    },
+    {
         "name": "kcp_accelerator_catalog",
         "description": "List supported Kaggle GPU IDs and offline profile requirements. Listing is not account entitlement.",
         "inputSchema": _schema(),
@@ -266,6 +290,18 @@ def _download(path: str, destination_dir: str, fallback_name: str) -> dict[str, 
 
 
 def _call(name: str, arguments: dict[str, Any]) -> Any:
+    if name == 'kcp_dataset_library':
+        payload, _ = _request('/api/datasets/library')
+        return _safe(payload)
+    if name == 'kcp_sync_dataset_library':
+        payload, _ = _request('/api/datasets/library/refresh', 'POST', arguments)
+        return _safe(payload)
+    if name == 'kcp_delete_dataset':
+        payload, _ = _request('/api/datasets/library/delete', 'POST', arguments)
+        return _safe(payload)
+    if name == 'kcp_check_dataset_deletion':
+        payload, _ = _request('/api/datasets/library/deletion-status', 'POST', arguments, timeout=150)
+        return _safe(payload)
     if name == "kcp_accelerator_catalog":
         payload, _ = _request("/api/accelerators/catalog")
         return _safe(payload)

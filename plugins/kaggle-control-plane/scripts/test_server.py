@@ -29,6 +29,20 @@ def test_redaction() -> None:
     assert value == {"token": "[REDACTED]", "nested": {"api_key": "[REDACTED]", "credential_available": True}}
 
 
+def test_dataset_library_tools_have_distinct_read_and_delete_routes() -> None:
+    with mock.patch.object(SERVER, '_request', return_value=({'datasets': []}, {})) as request:
+        SERVER._call('kcp_dataset_library', {})
+        request.assert_called_once_with('/api/datasets/library')
+    args = {'account_id': 'owner-account', 'dataset_ref': 'owner/sample-data',
+            'confirm_dataset_ref': 'owner/sample-data', 'confirm_delete': True, 'idempotency_key': 'delete-once-001'}
+    with mock.patch.object(SERVER, '_request', return_value=({'deletion': {'status': 'queued'}}, {})) as request:
+        SERVER._call('kcp_delete_dataset', args)
+        request.assert_called_once_with('/api/datasets/library/delete', 'POST', args)
+    with mock.patch.object(SERVER, '_request', return_value=({'deletion': {'status': 'uncertain'}}, {})) as request:
+        SERVER._call('kcp_check_dataset_deletion', {'deletion_id': 'one'})
+        request.assert_called_once_with('/api/datasets/library/deletion-status', 'POST', {'deletion_id': 'one'}, timeout=150)
+
+
 def test_cancellation_passes_explicit_session_identity() -> None:
     with mock.patch.object(SERVER, "_request", return_value=({"cancel_semantics": "remote_cancellation_pending"}, {})) as request:
         SERVER._call("kcp_job_action", {"job_id": "job-1", "action": "cancel", "kernel_session_id": 999, "session_ref": "owner/experiment"})
