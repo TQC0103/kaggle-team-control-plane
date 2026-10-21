@@ -108,6 +108,11 @@ class DatasetLibraryTests(unittest.TestCase):
         record=self.library.delete(self.payload(acknowledge_archive_loss=True),'test')['deletion']
         self.assertEqual(self.wait_delete(record['id'])['status'],'deleted')
 
+    def test_in_progress_local_eviction_blocks_remote_delete_even_with_ack(self):
+        self.library._data['verifications']['testowner/sample-data']={'local_eviction_pending':True}
+        with self.assertRaises(ConflictError):self.library.delete(self.payload(acknowledge_archive_loss=True),'test')
+        self.assertFalse(self.calls)
+
     def test_checksum_report_must_match_original_upload_hashes(self):
         files=[{'name':'payload.bin','bytes':3,'sha256':'a'*64}]
         with patch.object(self.service.datasets,'get_operation',return_value=dict(id='upload1',account_id=self.account['id'],dataset_ref='testowner/sample-data',kind='upload',files=files)):

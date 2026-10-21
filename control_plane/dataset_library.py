@@ -292,6 +292,7 @@ class DatasetLibrary:
                       'file_count': len(files), 'bytes': sum(size for _, size in reported.values()),
                       'operation_id': op['id'], 'last_updated': row.get('last_updated'), 'stale': False,
                       'local_evicted': payload.get('local_evicted') is True,
+                      'local_eviction_pending': payload.get('local_eviction_pending') is True,
                       'report_sha256': hashlib.sha256(json.dumps(reported, sort_keys=True).encode()).hexdigest()}
             self._data['verifications'][ref] = record
             self._save()
@@ -321,6 +322,8 @@ class DatasetLibrary:
             if self._dependencies(ref):
                 raise ConflictError('An active or unresolved job may depend on this dataset')
             verification = self._data['verifications'].get(ref, {})
+            if verification.get('local_eviction_pending'):
+                raise ConflictError('Local archive cleanup is in progress; wait before deleting its remote copy')
             if verification.get('local_evicted') and payload.get('acknowledge_archive_loss') is not True:
                 raise ValidationError('Local copy was removed; explicitly acknowledge loss of the archived copy')
             op = {'id': uuid.uuid4().hex, 'dataset_ref': ref, 'account_id': aid, 'idempotency_key': key,
