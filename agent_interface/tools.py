@@ -62,6 +62,12 @@ class ToolRegistry:
                 _object_schema(
                     {
                         "name": {"type": "string", "description": "Human-readable batch name."},
+                        "idempotency_key": {
+                            "type": "string",
+                            "minLength": 8,
+                            "maxLength": 128,
+                            "pattern": "^[A-Za-z0-9._:-]+$",
+                        },
                         "experiments": {
                             "type": "array",
                             "minItems": 1,
@@ -104,12 +110,15 @@ class ToolRegistry:
             Tool(
                 "cancel_run",
                 (
-                    "Cancel a queued experiment or stop local monitoring of an active one. "
-                    "Kaggle may keep an active remote kernel running; in that case the account "
-                    "is blocked until a human verifies the remote run and reconciles it in the dashboard."
+                    "Cancel a locally queued experiment, or request remote Kaggle session cancellation. "
+                    "KCP resolves its actual session ID automatically from the original owner/slug/version; "
+                    "explicit kernel_session_id and session_ref are optional. "
+                    "Failed resolution or an unconfirmed response keeps the job active; never infer cancellation."
                 ),
                 _object_schema(
-                    {"run_id": {"type": "string", "minLength": 1}},
+                    {"run_id": {"type": "string", "minLength": 1},
+                     "kernel_session_id": {"type": "integer", "minimum": 1},
+                     "session_ref": {"type": "string", "minLength": 3}},
                     required=["run_id"],
                 ),
                 self._cancel_run,
@@ -175,6 +184,8 @@ class ToolRegistry:
             for experiment in experiments
         ]
         body = {"name": name, "jobs": jobs}
+        if "idempotency_key" in args:
+            body["idempotency_key"] = _required_string(args, "idempotency_key")
         return self.client.request("POST", "/api/batches", body=body)
 
     def _list_runs(self, args: dict[str, Any]) -> Any:
@@ -189,7 +200,8 @@ class ToolRegistry:
         return self.client.request(
             "POST",
             f"/api/jobs/{_path_id(run_id)}/cancel",
-            body={},
+            body=_pick(args, "kernel_session_id", "session_ref"),
+            timeout=100,
         )
 
     def _retry_run(self, args: dict[str, Any]) -> Any:

@@ -10,7 +10,8 @@ class FakeClient:
     def __init__(self):
         self.calls = []
 
-    def request(self, method, path, *, query=None, body=None):
+    def request(self, method, path, *, query=None, body=None, timeout=None):
+        self.last_timeout = timeout
         self.calls.append((method, path, query, body))
         return {"method": method, "path": path}
 
@@ -75,10 +76,26 @@ class ToolTests(unittest.TestCase):
                 "kernel_slug": "augmentation-v1",
             },
         ]
-        self.registry.call("submit_batch", {"name": "sweep", "experiments": experiments})
+        self.registry.call(
+            "submit_batch",
+            {
+                "name": "sweep",
+                "experiments": experiments,
+                "idempotency_key": "agent-retry-0001",
+            },
+        )
         self.assertEqual(
             self.client.calls,
-            [("POST", "/api/batches", None, {"name": "sweep", "jobs": experiments})],
+            [(
+                "POST",
+                "/api/batches",
+                None,
+                {
+                    "name": "sweep",
+                    "jobs": experiments,
+                    "idempotency_key": "agent-retry-0001",
+                },
+            )],
         )
 
     def test_submit_batch_is_limited_to_ten_experiments(self):
@@ -97,6 +114,7 @@ class ToolTests(unittest.TestCase):
 
     def test_run_id_is_path_encoded(self):
         self.registry.call("cancel_run", {"run_id": "run/one"})
+        self.assertEqual(self.client.last_timeout, 100)
         self.assertEqual(
             self.client.calls[0],
             ("POST", "/api/jobs/run%2Fone/cancel", None, {}),

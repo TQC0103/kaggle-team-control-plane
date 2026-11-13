@@ -32,6 +32,11 @@ test("server-renders the Kaggle team control plane", async () => {
   assert.match(html, /Kaggle Team Control Plane/i);
   assert.match(html, /account/i);
   assert.match(html, /experiment/i);
+  assert.match(html, /id="datasets"/);
+  assert.match(html, /Upload dataset/);
+  assert.match(html, /Inspect &amp; manage/);
+  assert.match(html, /Datasets &amp; archived results/);
+  assert.match(html, /Sync Kaggle inventory/);
   assert.doesNotMatch(html, /codex-preview/i);
   assert.doesNotMatch(html, /Your site is taking shape/i);
 });

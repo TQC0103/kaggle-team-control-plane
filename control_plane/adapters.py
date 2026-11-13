@@ -24,6 +24,57 @@ KAGGLE_KERNEL_URL_PATTERN = re.compile(
 )
 DEFAULT_MAX_SOURCE_BYTES = 100 * 1024 * 1024
 DEFAULT_MAX_SOURCE_FILES = 10_000
+DEFAULT_GPU_MACHINE_SHAPE = "NvidiaTeslaT4"
+DEFAULT_TPU_MACHINE_SHAPE = "TpuV38"
+RUNTIME_MANIFEST_FIELDS = {
+    "accelerate",
+    "cuda_capability",
+    "cuda_device",
+    "cuda_runtime",
+    "pydantic",
+    "python",
+    "resolved_requirements_sha256",
+    "sentence_transformers",
+    "torch",
+    "transformers",
+}
+
+
+def hidden_subprocess_kwargs(platform_name: str | None = None) -> dict[str, Any]:
+    """Keep child CLIs invisible in the packaged Windows desktop app."""
+    if (platform_name or os.name) != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
+
+
+def read_runtime_manifest(output_dir: str | Path) -> dict[str, Any] | None:
+    """Read a bounded, allow-listed runtime.json from downloaded job output."""
+    root = Path(output_dir).resolve()
+    for candidate in sorted(root.rglob("runtime.json")):
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(root) or not resolved.is_file():
+            continue
+        if resolved.stat().st_size > 64 * 1024:
+            continue
+        try:
+            payload = json.loads(resolved.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        return {
+            key: value
+            for key, value in payload.items()
+            if key in RUNTIME_MANIFEST_FIELDS
+            and isinstance(value, (str, int, float, bool, list))
+        }
+    return None
 
 
 class AdapterError(RuntimeError):
@@ -50,6 +101,18 @@ class KaggleAdapter(Protocol):
     ) -> RemoteStatus: ...
 
     def output(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> dict[str, Any]: ...
+
+    def logs(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> str: ...
+
+    def terminal_logs(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> str: ...
+
+    def diagnostics(
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> dict[str, Any]: ...
 
@@ -143,15 +206,23 @@ def stage_job_source(
     # remote slug and then fail status polling against the requested id.
     metadata["title"] = expected_id.split("/", 1)[1]
     metadata["code_file"] = code_files[0].name
+    # Recheck after claim: a source edit between batch creation and staging
+    # must not silently re-enable network or change the offline runtime.
+    from .execution_profiles import validate_profile
+    offline = validate_profile(source, str(job.get('metadata',{}).get('machine_shape') or 'CPU'))
+    prior = job.get('metadata',{}).get('offline_preflight')
+    if prior is not None and offline != prior:
+        raise AdapterError('Offline profile changed after batch creation')
     accelerator = str(job.get("metadata", {}).get("accelerator", "auto"))
+    machine_shape = str(job.get("metadata", {}).get("machine_shape", ""))
     if accelerator == "gpu":
         metadata["enable_gpu"] = True
         metadata["enable_tpu"] = False
-        metadata["machine_shape"] = "NvidiaTeslaT4"
+        metadata["machine_shape"] = machine_shape or DEFAULT_GPU_MACHINE_SHAPE
     elif accelerator == "tpu":
         metadata["enable_gpu"] = False
         metadata["enable_tpu"] = True
-        metadata["machine_shape"] = "TpuV38"
+        metadata["machine_shape"] = machine_shape or DEFAULT_TPU_MACHINE_SHAPE
     elif accelerator == "cpu":
         metadata["enable_gpu"] = False
         metadata["enable_tpu"] = False
@@ -176,15 +247,77 @@ def stage_job_source(
 
 
 class KaggleCliAdapter:
-    def __init__(self, executable: str | None = None, command_poll_seconds: float = 0.1):
+    def __init__(
+        self,
+        executable: str | None = None,
+        command_poll_seconds: float = 0.1,
+        live_log_capture_seconds: float = 8.0,
+        auth_env_refresh=None,
+    ):
         self.executable = executable or os.environ.get("KCP_KAGGLE_EXECUTABLE", "kaggle")
         self.command_poll_seconds = command_poll_seconds
+        self.live_log_capture_seconds = max(0.1, live_log_capture_seconds)
+        self.auth_env_refresh = auth_env_refresh
+
+    def cancel(self, job, env, payload):
+        from .remote_cancel import cancel_session
+        if self.auth_env_refresh:
+            self.auth_env_refresh(env, False)
+        return cancel_session(job, env, payload)
+
+    def resolve_cancel_identity(self, job, env):
+        from .remote_cancel import resolve_session_identity
+        if self.auth_env_refresh:
+            self.auth_env_refresh(env, False)
+        return resolve_session_identity(job, env)
+
+    @staticmethod
+    def _auth_failure(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(term in message for term in (
+            "authentication required", "authentication failed", "401 unauthorized",
+            "401 client error", "token has expired", "invalid access token",
+        ))
+
+    @staticmethod
+    def _read_only(args: list[str]) -> bool:
+        if args and args[0] == "quota":
+            return True
+        pair = tuple(args[:2])
+        if pair == ("datasets", "metadata"):
+            return "--update" not in args
+        return pair in {
+            ("kernels", "status"), ("kernels", "logs"), ("kernels", "output"),
+            ("kernels", "list"), ("datasets", "status"), ("datasets", "files"),
+            ("competitions", "list"),
+            ("datasets", "download"), ("datasets", "list"),
+        }
 
     def _run(
         self,
         args: list[str],
         env: dict[str, str],
         cancel_event: threading.Event,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        if cancel_event.is_set():
+            raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
+        if self.auth_env_refresh:
+            self.auth_env_refresh(env, False)
+        try:
+            return self._run_once(args, env, cancel_event, timeout_seconds=timeout_seconds)
+        except AdapterError as exc:
+            # Never replay push/create/update or an ambiguous remote mutation.
+            if not self.auth_env_refresh or not self._read_only(args) or not self._auth_failure(exc) or cancel_event.is_set():
+                raise
+            if self.auth_env_refresh(env, True) is False:
+                raise
+            return self._run_once(args, env, cancel_event, timeout_seconds=timeout_seconds)
+
+    def _run_once(
+        self, args: list[str], env: dict[str, str], cancel_event: threading.Event,
+        *, timeout_seconds: float | None = None,
     ) -> str:
         if cancel_event.is_set():
             raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
@@ -193,27 +326,69 @@ class KaggleCliAdapter:
         with tempfile.TemporaryFile(
             mode="w+", encoding="utf-8", errors="replace"
         ) as output_file:
+            command_env = dict(env)
+            command_env["PYTHONIOENCODING"] = "utf-8"
+            command_env["PYTHONUTF8"] = "1"
+            command_env["PYTHONUNBUFFERED"] = "1"
             try:
                 process = subprocess.Popen(
                     [self.executable, *args],
-                    env=env,
+                    env=command_env,
                     stdout=output_file,
                     stderr=subprocess.STDOUT,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                     shell=False,
+                    **hidden_subprocess_kwargs(),
                 )
             except OSError as exc:
                 raise AdapterError(f"could not start Kaggle CLI: {exc}") from exc
+            deadline = (
+                time.monotonic() + timeout_seconds
+                if timeout_seconds is not None
+                else None
+            )
             while process.poll() is None:
                 if cancel_event.wait(self.command_poll_seconds):
-                    process.terminate()
+                    if os.name == 'nt':
+                        # The launcher has a Python child. Cancel only this
+                        # local CLI tree on app exit, not the remote kernel.
+                        try:
+                            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                           timeout=3, check=False, **hidden_subprocess_kwargs())
+                        except (OSError, subprocess.TimeoutExpired):
+                            process.terminate()
+                    else:
+                        process.terminate()
                     try:
                         process.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         process.kill()
                     raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
+                if deadline is not None and time.monotonic() >= deadline:
+                    if os.name == "nt":
+                        try:
+                            subprocess.run(
+                                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                                timeout=3,
+                                **hidden_subprocess_kwargs(),
+                            )
+                        except (OSError, subprocess.TimeoutExpired):
+                            pass
+                    else:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    raise AdapterError(
+                        f"Kaggle CLI timed out after {timeout_seconds:.0f}s: {' '.join(args[:3])}"
+                    )
             output_file.seek(0)
             output = output_file.read().strip()
             if process.returncode:
@@ -222,12 +397,192 @@ class KaggleCliAdapter:
                 )
             return output
 
+    def _run_follow_snapshot(
+        self,
+        args: list[str],
+        env: dict[str, str],
+        cancel_event: threading.Event,
+    ) -> str:
+        if cancel_event.is_set():
+            raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
+        if self.auth_env_refresh:
+            self.auth_env_refresh(env, False)
+        try:
+            return self._run_follow_snapshot_once(args, env, cancel_event)
+        except AdapterError as exc:
+            if not self.auth_env_refresh or not self._auth_failure(exc) or cancel_event.is_set():
+                raise
+            if self.auth_env_refresh(env, True) is False:
+                raise
+            return self._run_follow_snapshot_once(args, env, cancel_event)
+
+    def _run_follow_snapshot_once(
+        self, args: list[str], env: dict[str, str], cancel_event: threading.Event,
+    ) -> str:
+        """Capture a bounded snapshot from Kaggle's live SSE log stream.
+
+        The non-following CLI command reads only the persisted log blob, which
+        remains empty while a kernel is running. ``--follow`` exposes the live
+        stream and replays it from the beginning on each connection. We keep
+        the connection open briefly, then stop only our local CLI process; the
+        remote Kaggle kernel is unaffected.
+        """
+        if cancel_event.is_set():
+            raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
+        command_env = dict(env)
+        command_env["PYTHONIOENCODING"] = "utf-8"
+        command_env["PYTHONUTF8"] = "1"
+        # `kaggle kernels logs --follow` is a Python console program. Its
+        # stdout must not be buffered when Control Plane captures a bounded
+        # snapshot instead of attaching a terminal.
+        command_env["PYTHONUNBUFFERED"] = "1"
+        try:
+            process = subprocess.Popen(
+                [self.executable, *args],
+                env=command_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=0,
+                shell=False,
+                **hidden_subprocess_kwargs(),
+            )
+        except OSError as exc:
+            raise AdapterError(f"could not start Kaggle CLI: {exc}") from exc
+
+        def stop_follow_process() -> None:
+            """Stop only the local CLI process tree; Kaggle keeps the kernel running.
+
+            On Windows ``kaggle.exe`` launches a Python child that can retain
+            the stdout pipe after its launcher receives ``terminate``.  A
+            process-tree stop is necessary so a bounded live-log snapshot
+            cannot pin the scheduler worker indefinitely.
+            """
+            if process.poll() is not None:
+                return
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=3,
+                        **hidden_subprocess_kwargs(),
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            else:
+                process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        # Drain continuously. A temporary output file only exposes data after
+        # the CLI flushes and can lose a partial live line when we stop its
+        # local `--follow` process. Character reads preserve exactly what the
+        # Kaggle stream has emitted without risking a pipe-buffer deadlock.
+        output_chunks: list[str] = []
+        output_lock = threading.Lock()
+
+        def drain_stdout() -> None:
+            assert process.stdout is not None
+            while True:
+                chunk = process.stdout.read(1)
+                if not chunk:
+                    return
+                with output_lock:
+                    output_chunks.append(chunk)
+
+        reader = threading.Thread(target=drain_stdout, name="kcp-live-log-reader", daemon=True)
+        reader.start()
+        deadline = time.monotonic() + self.live_log_capture_seconds
+        stopped_after_snapshot = False
+        try:
+            while process.poll() is None and time.monotonic() < deadline:
+                remaining = max(0.0, deadline - time.monotonic())
+                if cancel_event.wait(min(self.command_poll_seconds, remaining)):
+                    stop_follow_process()
+                    raise LocalCommandCancelled("local Kaggle CLI command was cancelled")
+            if process.poll() is None:
+                stopped_after_snapshot = True
+                stop_follow_process()
+        finally:
+            # Some Windows console process trees retain the inherited write
+            # end briefly after the CLI parent exits. Never let that keep the
+            # scheduler worker blocked indefinitely. Do not close a pipe while
+            # the reader is blocked in a Windows read: TextIOWrapper.close()
+            # can itself wait for the inherited writer. The daemon owns the
+            # handle until EOF in that rare case.
+            reader.join(timeout=0.5)
+            if not reader.is_alive() and process.stdout is not None:
+                process.stdout.close()
+
+        with output_lock:
+            output = "".join(output_chunks).strip()
+        if not stopped_after_snapshot and process.returncode:
+            raise AdapterError(
+                f"Kaggle CLI exited with {process.returncode}: {output[-2000:]}"
+            )
+        return output
+
+    @staticmethod
+    def _kernel_log_text(output: str) -> str:
+        """Convert Kaggle's JSON log envelope into the web-visible text.
+
+        Current Kaggle CLI returns a JSON array of stream records even without
+        a JSON flag.  Its ``data`` fields are exactly what the notebook log UI
+        renders.  A bounded ``--follow`` capture can end mid-array, so decode
+        complete objects one at a time rather than requiring valid whole JSON.
+        Plain-text output remains untouched for older CLI versions.
+        """
+        if not output.strip():
+            return ""
+        decoder = json.JSONDecoder()
+        position = 0
+        length = len(output)
+        while position < length and output[position].isspace():
+            position += 1
+        if position >= length or output[position] != "[":
+            return output
+        position += 1
+        records: list[str] = []
+        while position < length:
+            while position < length and (output[position].isspace() or output[position] == ","):
+                position += 1
+            if position >= length or output[position] == "]":
+                break
+            try:
+                record, position = decoder.raw_decode(output, position)
+            except json.JSONDecodeError:
+                # The local follower was intentionally stopped during this
+                # record; retain parsed records and wait for the next snapshot.
+                break
+            if isinstance(record, dict) and isinstance(record.get("data"), str):
+                records.append(record["data"])
+        return "".join(records) if records else output
+
     def submit(
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> dict[str, Any]:
+        args = ["kernels", "push", "-p", job["source_dir"]]
+        machine_shape = str(job.get("metadata", {}).get("machine_shape", ""))
+        if machine_shape:
+            args.extend(["--accelerator", machine_shape])
         output = self._run(
-            ["kernels", "push", "-p", job["source_dir"]], env, cancel_event
+            args, env, cancel_event
         )
+        # Kaggle can reject a push while its CLI still exits with code zero.
+        # Never let an existing kernel's status hide an explicit push failure.
+        if re.search(r"\bKernel\s+push\s+error\s*:", output, re.IGNORECASE):
+            raise AdapterError(output[-2000:])
         expected_owner, expected_slug = job["kernel_slug"].split("/", 1)
         match = KAGGLE_KERNEL_URL_PATTERN.search(output)
         if match:
@@ -242,25 +597,49 @@ class KaggleCliAdapter:
                     f"{expected_owner}/{expected_slug}. Verify that the credential belongs "
                     "to the registered Kaggle username and retry with a new kernel slug."
                 )
-        return {"kernel_slug": job["kernel_slug"], "cli_message": output[-2000:]}
+        result = {"kernel_slug": job["kernel_slug"], "cli_message": output[-2000:]}
+        version = re.search(r"\bKernel version (\d+) successfully pushed\b", output, re.IGNORECASE)
+        if version:
+            result["version_number"] = int(version.group(1))
+        return result
 
     def status(
         self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
     ) -> RemoteStatus:
+        status_ref = job["kernel_slug"]
+        cancellation = (job.get("result") or {}).get("cancellation") or {}
+        resolution = cancellation.get("resolution") or {}
+        receipt = (job.get("result") or {}).get("submit") or {}
+        if job.get("cancel_requested") and resolution.get("version_number"):
+            status_ref += "/" + str(resolution["version_number"])
+        elif (receipt.get("kernel_slug") == status_ref
+              and type(receipt.get("version_number")) is int
+              and receipt["version_number"] > 0):
+            # Recovery must query the accepted version, not a later notebook
+            # push that happens to reuse its owner/slug.
+            status_ref += "/" + str(receipt["version_number"])
         output = self._run(
-            ["kernels", "status", job["kernel_slug"]], env, cancel_event
+            ["kernels", "status", status_ref],
+            env,
+            cancel_event,
+            timeout_seconds=20,
         )
-        normalized = output.casefold()
-        if any(word in normalized for word in ("error", "failed", "failure")):
-            state = "failed"
-        elif any(word in normalized for word in ("complete", "success")):
-            state = "complete"
-        elif "cancel" in normalized:
+        # The CLI wraps the actual enum in 'has status "..."'. A warning,
+        # empty response or HTTP error is not evidence of a queued session.
+        match = re.search(
+            r"\bhas\s+status\s+[\"']?(?:KernelWorkerStatus\.)?(queued|running|complete|error|cancelled|canceled|cancel_requested|cancel_acknowledged)\b",
+            output, re.IGNORECASE,
+        )
+        if not match:
+            raise AdapterError("Unrecognized Kaggle kernel status response: " + output[-2000:])
+        state = {"error": "failed", "canceled": "cancelled",
+                 "cancel_requested": "running", "cancel_acknowledged": "cancelled"}.get(
+            match.group(1).lower(), match.group(1).lower()
+        )
+        if state == "failed" and job.get("cancel_requested") and re.search(
+            r'Failure message:\s*["\']?(?:User\s+)?cancel(?:led|ed)(?:\s+by\s+(?:the\s+)?user)?[.!"\'\s]*$', output, re.IGNORECASE
+        ):
             state = "cancelled"
-        elif any(word in normalized for word in ("running", "active")):
-            state = "running"
-        else:
-            state = "queued"
         return RemoteStatus(state, output[-2000:])
 
     def output(
@@ -285,16 +664,65 @@ class KaggleCliAdapter:
             for path in output_dir.rglob("*")
             if path.is_file()
         ][:1000]
-        return {
+        result = {
             "output_dir": str(output_dir),
             "files": sorted(files),
             "cli_message": message[-2000:],
+        }
+        runtime = read_runtime_manifest(output_dir)
+        if runtime:
+            result["runtime"] = runtime
+        return result
+
+    def logs(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> str:
+        raw = self._run_follow_snapshot(
+            ["kernels", "logs", "--follow", job["kernel_slug"]], env, cancel_event
+        )
+        return self._kernel_log_text(raw)
+
+    def terminal_logs(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> str:
+        """Read Kaggle's immutable log after a kernel reaches a terminal state."""
+        return self._kernel_log_text(self._run(
+            ["kernels", "logs", job["kernel_slug"]],
+            env,
+            cancel_event,
+            timeout_seconds=30,
+        ))
+
+    def diagnostics(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> dict[str, Any]:
+        output_dir = Path(job["output_dir"]).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        message = self.terminal_logs(job, env, cancel_event)
+        if not message:
+            raise AdapterError("Kaggle returned an empty kernel diagnostic log")
+        target = output_dir / f"{job['kernel_slug'].split('/', 1)[-1]}.log"
+        target.write_text(message + "\n", encoding="utf-8", newline="\n")
+        return {
+            "output_dir": str(output_dir),
+            "files": [target.name],
+            "cli_message": "Downloaded Kaggle kernel execution log",
         }
 
     def quota(
         self, env: dict[str, str], cancel_event: threading.Event
     ) -> dict[str, Any]:
         output = self._run(["quota", "--format", "json"], env, cancel_event)
+        # The official CLI can emit its API-version warning before valid JSON.
+        # _run merges stderr into stdout, so strip only this known whole-line
+        # notice. Auth errors, arbitrary prefixes and trailing junk still fail.
+        output = re.sub(
+            r"\A(?:Warning: Looks like you're using an outdated (?:API Version[^\r\n]*|"
+            r"`kaggle` version \(installed: [0-9A-Za-z.+_-]+\), please consider upgrading "
+            r"to the latest version \([0-9A-Za-z.+_-]+\))\r?\n(?:\r?\n)*)+",
+            "",
+            output.lstrip("\ufeff"),
+        )
         try:
             rows = json.loads(output)
         except json.JSONDecodeError as exc:
@@ -340,6 +768,7 @@ class FakeKaggleAdapter:
         self.poll_delay_seconds = poll_delay_seconds
         self._lock = threading.Lock()
         self._polls: dict[str, int] = {}
+        self._log_polls: dict[str, int] = {}
         self.max_in_flight = 0
         self._in_flight = 0
         self._active_remote_jobs: set[str] = set()
@@ -358,6 +787,9 @@ class FakeKaggleAdapter:
     ) -> dict[str, Any]:
         if cancel_event.is_set():
             raise LocalCommandCancelled("fake submit cancelled")
+        submit_error = job["metadata"].get("fake_submit_error")
+        if submit_error:
+            raise AdapterError(str(submit_error))
         with self._lock:
             self._in_flight += 1
             self._active_remote_jobs.add(job["id"])
@@ -422,6 +854,21 @@ class FakeKaggleAdapter:
                 self._in_flight -= 1
         output_dir = Path(job["output_dir"]).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
+        if str(job["metadata"].get("fake_outcome", "complete")) == "failed":
+            log_path = output_dir / f"{job['kernel_slug'].split('/', 1)[-1]}.log"
+            log_path.write_text(
+                str(
+                    job["metadata"].get(
+                        "fake_remote_log", "Traceback: fake remote kernel failure"
+                    )
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "output_dir": str(output_dir),
+                "files": [log_path.name],
+                "cli_message": "Downloaded failed kernel diagnostics",
+            }
         payload = job["metadata"].get("fake_result", {"score": 0.5})
         result_path = output_dir / "fake-result.json"
         result_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
@@ -429,4 +876,45 @@ class FakeKaggleAdapter:
             "output_dir": str(output_dir),
             "files": [result_path.name],
             "fake_result": payload,
+        }
+
+    def logs(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> str:
+        if cancel_event.is_set():
+            raise LocalCommandCancelled("fake log sync cancelled")
+        configured = job["metadata"].get("fake_live_logs", "")
+        if not isinstance(configured, list):
+            return str(configured)
+        with self._lock:
+            count = self._log_polls.get(job["id"], 0) + 1
+            self._log_polls[job["id"]] = count
+        return "\n".join(str(line) for line in configured[:count])
+
+    def terminal_logs(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> str:
+        if cancel_event.is_set():
+            raise LocalCommandCancelled("fake terminal-log read cancelled")
+        return str(job["metadata"].get("fake_terminal_log", ""))
+
+    def diagnostics(
+        self, job: dict[str, Any], env: dict[str, str], cancel_event: threading.Event
+    ) -> dict[str, Any]:
+        if cancel_event.is_set():
+            raise LocalCommandCancelled("fake diagnostics cancelled")
+        output_dir = Path(job["output_dir"]).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        log_path = output_dir / f"{job['kernel_slug'].split('/', 1)[-1]}.log"
+        message = self.terminal_logs(job, env, cancel_event) or str(
+            job["metadata"].get("fake_remote_log", "Traceback: fake remote kernel failure")
+        )
+        log_path.write_text(
+            message,
+            encoding="utf-8",
+        )
+        return {
+            "output_dir": str(output_dir),
+            "files": [log_path.name],
+            "cli_message": "Downloaded failed kernel diagnostics",
         }

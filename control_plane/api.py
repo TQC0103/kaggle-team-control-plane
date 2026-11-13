@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .errors import ControlPlaneError, NotFoundError, ValidationError
 from .service import ControlPlaneService
+from .dataset_transfer import publish_private_checkpoint, check_private_checkpoint_access, private_checkpoint_status
 
 
 LOCAL_ORIGIN = re.compile(r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?$")
@@ -104,6 +105,14 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             self.log_error("unhandled request error: %s", exc)
 
     def _download(self, path: str) -> bool:
+        if path == "/api/support-bundle/download":
+            filename, file_path = self.server.service.support_bundle_download()
+            self._send_download_headers(
+                filename, "application/zip", file_path.stat().st_size
+            )
+            with file_path.open("rb") as source:
+                shutil.copyfileobj(source, self.wfile, length=1024 * 1024)
+            return True
         logs = re.fullmatch(r"/api/jobs/([^/]+)/logs/download", path)
         if logs:
             filename, file_path = self.server.service.job_logs_download(logs.group(1))
@@ -193,6 +202,44 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             return 200, service.health()
         if method == "GET" and path == "/api/accounts":
             return 200, {"accounts": service.list_accounts()}
+        if method == 'GET' and path == '/api/accelerators/catalog':
+            from .execution_profiles import catalog
+            return 200, catalog()
+        competition_access = re.fullmatch(r'/api/accounts/([^/]+)/competitions', path)
+        if method == 'GET' and competition_access:
+            from .competition_access import entered_competitions
+            return 200, entered_competitions(service, competition_access.group(1))
+        if method == "GET" and path == "/api/datasets/operations":
+            return 200, {"operations": service.datasets.list_operations()}
+        if method == 'GET' and path == '/api/artifacts/archive':
+            return 200, service.artifact_archive.snapshot()
+        if method == 'POST' and path == '/api/artifacts/archive/config':
+            return 200, service.artifact_archive.configure(body)
+        if method == 'GET' and path == '/api/datasets/library':
+            return 200, service.dataset_library.snapshot()
+        if method == 'POST' and path == '/api/datasets/library/refresh':
+            return 202, service.dataset_library.refresh(body)
+        if method == 'POST' and path == '/api/datasets/library/verification':
+            return 200, service.dataset_library.register_verification(body, actor)
+        if method == 'POST' and path == '/api/datasets/library/delete':
+            return 202, service.dataset_library.delete(body, actor)
+        if method == 'POST' and path == '/api/datasets/library/deletion-status':
+            return 200, service.dataset_library.reconcile(body)
+        dataset_operation = re.fullmatch(r"/api/datasets/operations/([a-f0-9]{32})", path)
+        if method == "GET" and dataset_operation:
+            return 200, {"operation": service.datasets.get_operation(dataset_operation.group(1))}
+        if method == "POST" and path == "/api/datasets/prepare":
+            return 200, service.datasets.prepare(body)
+        if method == "POST" and path == "/api/datasets/inspect":
+            return 200, service.datasets.inspect(body)
+        if method == "POST" and path == "/api/datasets/operations":
+            return 202, {"operation": service.datasets.submit(body, actor)}
+        if method == "POST" and path == "/api/datasets/private-checkpoint/publish":
+            return 200, publish_private_checkpoint(service, body, actor)
+        if method == "POST" and path == "/api/datasets/private-checkpoint/access":
+            return 200, check_private_checkpoint_access(service, body, actor)
+        if method == "POST" and path == "/api/datasets/private-checkpoint/status":
+            return 200, private_checkpoint_status(service, body, actor)
         if method == "POST" and path == "/api/credentials/inspect":
             return 200, service.inspect_credential(body)
         if method == "GET" and path == "/api/credentials":
@@ -225,19 +272,50 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             return 200, {"batch": service.get_batch(match.group(1))}
 
         if method == "GET" and path == "/api/jobs":
+            raw_limit = self._query_one(query, "limit")
+            try:
+                limit = int(raw_limit) if raw_limit else None
+            except ValueError as exc:
+                raise ValidationError("job limit must be an integer") from exc
+            if limit is not None and not 1 <= limit <= 1000:
+                raise ValidationError("job limit must be between 1 and 1000")
             return 200, {
                 "jobs": service.list_jobs(
                     batch_id=self._query_one(query, "batch_id"),
                     account_id=self._query_one(query, "account_id"),
                     status=self._query_one(query, "status"),
+                    limit=limit,
+                    summary=self._query_one(query, "summary") in {"1", "true"},
                 )
             }
+        if method == "GET" and path == "/api/jobs/stats":
+            return 200, {"states": service.job_state_counts()}
         match = re.fullmatch(r"/api/jobs/([^/]+)", path)
         if match and method == "GET":
-            return 200, {"job": service.get_job(match.group(1))}
+            raw_event_limit = self._query_one(query, "event_limit") or "200"
+            raw_log_limit = self._query_one(query, "remote_log_limit") or "500"
+            try:
+                event_limit = int(raw_event_limit)
+                remote_log_limit = int(raw_log_limit)
+            except ValueError as exc:
+                raise ValidationError("job detail limits must be integers") from exc
+            if not 1 <= event_limit <= 1000 or not 1 <= remote_log_limit <= 500:
+                raise ValidationError("job detail limits are out of range")
+            return 200, {
+                "job": service.get_job(
+                    match.group(1),
+                    include_remote_logs=self._query_one(query, "include_remote_logs")
+                    not in {"0", "false"},
+                    event_limit=event_limit,
+                    remote_log_limit=remote_log_limit,
+                )
+            }
+        match = re.fullmatch(r"/api/jobs/([^/]+)/remote-status", path)
+        if match and method == "GET":
+            return 200, service.remote_job_status(match.group(1))
         match = re.fullmatch(r"/api/jobs/([^/]+)/cancel", path)
         if match and method == "POST":
-            return 202, service.cancel_job(match.group(1), actor)
+            return 202, service.cancel_job(match.group(1), actor, body)
         match = re.fullmatch(r"/api/jobs/([^/]+)/retry", path)
         if match and method == "POST":
             return 202, {"job": service.retry_job(match.group(1), actor)}
@@ -254,6 +332,18 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 raise ValidationError("event pagination values must be integers") from exc
             return 200, service.job_events_page(
+                match.group(1), before_id=before_id, limit=limit
+            )
+        match = re.fullmatch(r"/api/jobs/([^/]+)/logs", path)
+        if match and method == "GET":
+            raw_limit = self._query_one(query, "limit") or "200"
+            raw_before = self._query_one(query, "before_id")
+            try:
+                limit = int(raw_limit)
+                before_id = int(raw_before) if raw_before else None
+            except ValueError as exc:
+                raise ValidationError("log pagination values must be integers") from exc
+            return 200, service.job_remote_logs_page(
                 match.group(1), before_id=before_id, limit=limit
             )
 

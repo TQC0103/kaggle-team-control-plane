@@ -1,0 +1,114 @@
+name: Release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer version without a leading v
+        required: true
+        default: 0.2.0-beta.1
+        type: string
+      publish_prerelease:
+        description: Publish a GitHub prerelease after building
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: desktop-requirements.txt
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22.13.0"
+          cache: npm
+
+      - name: Validate version
+        shell: pwsh
+        run: |
+          if ('${{ inputs.version }}' -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
+            throw 'version must be SemVer-like and must not include a leading v'
+          }
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -r desktop-requirements.txt
+          npm ci
+          winget install --id JRSoftware.InnoSetup --exact --silent --accept-package-agreements --accept-source-agreements
+
+      - name: Run verification suite
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests_backend -v
+          python -m unittest discover -s tests_desktop -v
+          python -m unittest discover -s agent_interface/tests -v
+          python -m pytest plugins/kaggle-control-plane/scripts/test_server.py -q
+          npm run lint
+          npm test
+
+      - name: Build desktop
+        shell: pwsh
+        run: .\scripts\build-desktop.ps1 -Version '${{ inputs.version }}'
+
+      - name: Sign desktop executable when certificate is configured
+        shell: pwsh
+        env:
+          KCP_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          KCP_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          if ($env:KCP_SIGNING_CERTIFICATE_BASE64) {
+            .\scripts\sign-windows.ps1 -Path .\release\KaggleControlPlane\KaggleControlPlane.exe
+          } else {
+            Write-Host 'Signing certificate is not configured; producing an unsigned candidate.'
+          }
+
+      - name: Build installer
+        shell: pwsh
+        run: .\scripts\build-installer.ps1 -SkipAppBuild -Version '${{ inputs.version }}'
+
+      - name: Sign installer and refresh checksum when certificate is configured
+        shell: pwsh
+        env:
+          KCP_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          KCP_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          if ($env:KCP_SIGNING_CERTIFICATE_BASE64) {
+            .\scripts\sign-windows.ps1 -Path .\release\installer\KaggleControlPlane-Setup.exe
+            .\scripts\write-installer-checksum.ps1
+          }
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v6
+        with:
+          name: KaggleControlPlane-${{ inputs.version }}-windows-x64
+          path: |
+            release/installer/KaggleControlPlane-Setup.exe
+            release/installer/KaggleControlPlane-Setup.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub prerelease
+        if: ${{ inputs.publish_prerelease }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ inputs.version }}" `
+            release/installer/KaggleControlPlane-Setup.exe `
+            release/installer/KaggleControlPlane-Setup.exe.sha256 `
+            --prerelease `
+            --generate-notes `
+            --title "Kaggle Control Plane v${{ inputs.version }}"
