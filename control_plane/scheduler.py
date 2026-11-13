@@ -88,8 +88,11 @@ class JobScheduler:
             }
 
     def active_jobs_for_account(self, account_id: str) -> int:
+        # Recovered remote jobs have no executor future. Their active database
+        # rows still occupy real Kaggle slots after a successful reconciliation.
+        persisted = self.database.active_job_count(account_id)
         with self._lock:
-            return self._active_account_jobs.get(account_id, 0)
+            return max(persisted, self._active_account_jobs.get(account_id, 0))
 
     def request_cancel(self, job_id: str) -> None:
         with self._lock:
@@ -265,7 +268,7 @@ class JobScheduler:
             if capacity <= 0:
                 break
             account_id = job["account_id"]
-            if active_account_jobs.get(account_id, 0) >= self.max_jobs_per_account:
+            if self.active_jobs_for_account(account_id) >= self.max_jobs_per_account:
                 continue
             account = self.database.get_account(account_id)
             if account["state"] == "revoked":

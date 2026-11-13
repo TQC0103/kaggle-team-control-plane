@@ -211,6 +211,10 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             return 200, entered_competitions(service, competition_access.group(1))
         if method == "GET" and path == "/api/datasets/operations":
             return 200, {"operations": service.datasets.list_operations()}
+        if method == 'GET' and path == '/api/artifacts/archive':
+            return 200, service.artifact_archive.snapshot()
+        if method == 'POST' and path == '/api/artifacts/archive/config':
+            return 200, service.artifact_archive.configure(body)
         if method == 'GET' and path == '/api/datasets/library':
             return 200, service.dataset_library.snapshot()
         if method == 'POST' and path == '/api/datasets/library/refresh':

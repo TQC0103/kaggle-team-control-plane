@@ -1,0 +1,3 @@
+google-cloud-firestore==2.21.0
+google-cloud-secret-manager==2.24.0
+kagglesdk==0.1.38

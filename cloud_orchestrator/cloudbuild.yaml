@@ -1,0 +1,10 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ['build', '--build-arg', 'KCP_SOURCE_SHA=${_SOURCE_SHA}', '--build-arg', 'KCP_BASE_IMAGE=${_BASE_IMAGE}', '-t', '${_IMAGE}', '.']
+images: ['${_IMAGE}']
+tags: ['kcp-cloud-shadow', '${_TAG}']
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: 600s
+substitutions:
+  _BASE_IMAGE: python:3.12-slim

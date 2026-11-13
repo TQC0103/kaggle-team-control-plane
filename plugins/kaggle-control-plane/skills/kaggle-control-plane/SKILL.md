@@ -1,6 +1,6 @@
 ---
 name: kaggle-control-plane
-description: Use the local Kaggle Control Plane to inspect accounts and quota, run or monitor Kaggle GPU and batch workloads, download results, diagnose benchmark logs, or maintain the Control Plane desktop app without exposing credentials.
+description: Use the local Kaggle Control Plane to inspect accounts and quota, run or monitor Kaggle workloads, proactively archive validated research artifacts to private Kaggle datasets, diagnose logs, or maintain the desktop app without exposing credentials.
 ---
 
 # Kaggle Control Plane
@@ -14,6 +14,9 @@ result.
 
 - For account, quota, submission, monitoring, cancellation, retry, or artifact
   operations, follow **Remote workflow** below.
+- After collecting/validating research outputs, or when continuing a project
+  with an archive queue, follow **Proactive private artifact archiving** and
+  [references/artifact-cloud.md](references/artifact-cloud.md).
 - When packaging or diagnosing a model benchmark, read
   [references/benchmark-runtime.md](references/benchmark-runtime.md).
 - When changing, rebuilding, packaging, or troubleshooting the Control Plane
@@ -30,7 +33,7 @@ Do not load both references unless the task genuinely spans both modes.
    once. Do not silently fall back to a heavy laptop run.
 2. Before submission, list accounts and use only an enabled account with
    relevant remaining quota. Prefer a user-named account; otherwise select the
-   best available account and report the choice.
+   account using the packing preference below and report the choice.
 3. Stage the narrow source bundle inside the Control Plane's allowed
    `experiments` source root before submission. It must contain
    `kernel-metadata.json`; never submit a repository root, home directory,
@@ -51,9 +54,39 @@ Do not load both references unless the task genuinely spans both modes.
    normalized `accelerator`, `machine_shape`, `elapsed_seconds`, and optional
    `runtime` as authoritative.
 7. Download only to an explicit project output directory. Runtime results stay
-   ignored by Git.
+   ignored by Git. After validation, enqueue retained bulky artifacts for private
+   cloud archiving as part of the same workflow; do not wait for a cleanup request.
 8. Report account ID, shape, source directory, kernel slug, job ID, final state,
    and artifact location. Omit usernames unless requested.
+
+### Account packing preference
+
+The user prefers to use small remaining GPU balances first. Apply this to
+already-authorized jobs; it does not create new experiments or change scientific
+gates.
+
+- Get fresh official quota, account state, active sessions and input permissions.
+  Respect a user-named account first. Otherwise prefer eligible accounts with a
+  small positive balance around one hour (use 0 < remaining <= 2 GPU-hours as a
+  practical band), ahead of accounts with large unused balances.
+- Within that band, prefer an account with two free GPU slots and use the smaller
+  positive balance first. Assign the longest estimated ready jobs first. If only
+  one slot is free, use it and place the next job on another eligible account;
+  do not idle ready work waiting for a perfect pair.
+- Estimate each job's wall time and GPU-hours, including setup, training,
+  validation and output saving. Print the range, account ID, remaining quota
+  and proposed pair before submission. Do not reject an otherwise eligible
+  account solely because either estimate or the pair's total exceeds its
+  remaining quota; let Kaggle decide admission.
+- Pack two independent, input-validated jobs into one bounded idempotent batch
+  for that account when both slots are free. Keep the two-jobs/account limit,
+  reconcile unknown sessions first, and verify each exact remote notebook/version
+  before calling it submitted. Never pack a child before its parent validates.
+- A small positive balance is not a guarantee that Kaggle will admit two jobs or
+  let them finish after the balance reaches zero. Preserve full-state checkpoints
+  for continuation. On an actual quota refusal, record it and inspect the next
+  eligible account's quota and input access; do not blindly resubmit or alter
+  quota records.
 
 ### Cancellation identity and confirmation
 
@@ -79,6 +112,35 @@ and build identity, never credentials, usernames, paths, job logs, or artifacts.
 Use the laptop for unit tests, formatting, schema validation, dataset parsing,
 and short smoke checks only. Use Control Plane for embeddings, batch model
 evaluation, training, and other GPU-heavy work.
+
+## Proactive private artifact archiving
+
+KCP has a persistent automatic archive queue. Use `kcp_artifact_archive` to
+inspect it and `kcp_configure_artifact_archive` to enable it under the user's
+standing authorization. Enabled applies to every future completed run, not a
+fixed experiment list; include current job IDs when enabling for an active
+project. The app resumes discovery, transfer reconciliation and readback on
+startup without an agent prompt. See `references/artifact-cloud.md` for limits.
+
+For this user's approved research artifacts, private cloud archiving is a
+standing preference and part of completing a run. Act on it without asking the
+user to repeat an upload request. This covers existing authorized project
+outputs and newly validated checkpoints, probability caches and retained data;
+it does not authorize public visibility, new readers, remote deletion or GPU jobs.
+
+- On result validation and project continuation, reconcile the durable archive
+  queue, then start or resume ready transfers if no live owner already handles
+  them. Use bounded parallel uploads on separate eligible accounts; GPU-hour
+  exhaustion alone does not prevent dataset storage.
+- Upload immutable, deduplicated payloads to private datasets, verify full remote
+  byte sizes and SHA-256, persist restore metadata and register the proof in KCP.
+- Where the user has authorized local cleanup, evict only verified copies that
+  no active job/controller/validator needs. Keep small reports and restore indexes
+  local. An upload receipt or inventory listing alone never permits eviction.
+- Before handing off, record what actually completed, what is transferring, and
+  any blocker. A stale RUNNING label is not a live uploader. A skill is agent
+  guidance, not a daemon: only claim background transfer when a live worker with
+  a durable journal exists. See the reference for recovery and protection rules.
 
 ## Dataset inventory and archived results
 

@@ -112,6 +112,8 @@ type SourceListing = {
   directories: SourceDirectory[];
 };
 
+type StartupSettings = { supported: boolean; enabled: boolean; registered: boolean; disabled_by_windows?: boolean; reason?: string };
+
 type DesktopSettings = {
   desktop: boolean;
   source_root: string;
@@ -120,10 +122,12 @@ type DesktopSettings = {
   restart_required: boolean;
   version?: string;
   build_sha?: string;
+  startup?: StartupSettings;
 };
 
 type DesktopResult = {
   ok: boolean;
+  startup?: StartupSettings;
   state?: "idle" | "pending" | "succeeded" | "failed";
   error?: string;
   cancelled?: boolean;
@@ -139,6 +143,7 @@ type DesktopResult = {
 
 type DesktopApi = {
   get_settings: () => Promise<DesktopSettings>;
+  set_startup: (enabled: boolean) => Promise<DesktopResult>;
   save_credential: (credentialRef: string, token: string) => Promise<DesktopResult>;
   start_kaggle_oauth: (credentialRef: string) => Promise<DesktopResult>;
   get_kaggle_oauth_status: () => Promise<DesktopResult>;
@@ -1178,6 +1183,22 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
     onChanged("Source folder saved. Restart the app once to activate it.");
   };
 
+  const toggleStartup = async () => {
+    if (busy || !settings?.startup?.supported) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await window.pywebview?.api.set_startup(!settings.startup.enabled);
+      if (!result?.ok || !result.startup) throw new Error(result?.error || "Could not update Windows startup.");
+      setSettings((current) => current ? { ...current, startup: result.startup } : current);
+      onChanged(result.startup.enabled ? "KCP will start when you sign in to Windows." : "Windows startup disabled.");
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Could not update Windows startup.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const checkUpdates = async () => {
     const api = window.pywebview?.api;
     if (!api || checkingUpdate) return;
@@ -1198,6 +1219,13 @@ function DesktopSettingsDialog({ onClose, onChanged }: {
         </header>
         <div className="desktop-settings-body">
           {error && <p className="form-error" role="alert">{error}</p>}
+          <section className="settings-section">
+            <div><p className="section-label">WINDOWS STARTUP</p><h3>Start with Windows</h3></div>
+            <p className="settings-help">Open KCP automatically when you sign in. Enabled artifact backups resume from the saved queue when the app has a network connection. Keep the app running to continue transfers.</p>
+            <button className="button button-quiet" type="button" disabled={busy || !settings?.startup?.supported} aria-pressed={settings?.startup?.enabled === true} onClick={() => void toggleStartup()}>{settings?.startup?.enabled ? "Enabled — turn off" : "Enable Windows startup"}</button>
+            {settings?.startup?.disabled_by_windows && <p className="settings-help">Windows has disabled this startup entry. Enable it here to restore automatic startup.</p>}
+            {settings?.startup && !settings.startup.supported && <p className="settings-help">{settings.startup.reason}</p>}
+          </section>
           <section className="settings-section">
             <div><p className="section-label">ENCRYPTED TOKENS</p><h3>Owner credentials</h3></div>
             <div className="oauth-onboarding">

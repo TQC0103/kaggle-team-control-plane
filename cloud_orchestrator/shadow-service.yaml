@@ -1,0 +1,33 @@
+# Review template. Substitute IMAGE, PROJECT_ID and SERVICE_ACCOUNT only after
+# authenticated billing/IAM/free-allowance preflight. Never apply to desktop KCP.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: kcp-cloud-shadow
+  labels:
+    cloud.googleapis.com/location: us-central1
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "1"
+        run.googleapis.com/cpu-throttling: "true"
+        run.googleapis.com/startup-cpu-boost: "false"
+    spec:
+      serviceAccountName: SERVICE_ACCOUNT
+      containerConcurrency: 1
+      timeoutSeconds: 60
+      containers:
+        - image: IMAGE
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          env:
+            - name: GOOGLE_CLOUD_PROJECT
+              value: PROJECT_ID
+            - name: KCP_CLOUD_MODE
+              value: shadow

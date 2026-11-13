@@ -76,6 +76,20 @@ Credential/config files, links, protected directories and KCP's internal data
 cannot be selected. Each selection is limited to 10,000 files / 100 GiB; one
 dataset mutation per account runs at a time, with different accounts independent.
 
+### Start with Windows and automatic artifact backup
+
+In the installed Windows app, open **Local app settings → Start with Windows**.
+This per-user toggle starts KCP at Windows sign-in, without administrator rights.
+It can be turned off in the same place. A second launch exits without creating
+another scheduler or archive worker.
+
+Enable **Automatic private artifact backup** on the datasets page to back up
+future completed job outputs. The persistent queue resumes discovery, interrupted
+transfer reconciliation and full SHA-256 readback when KCP starts again. Original
+local files are retained. The PC must be awake and KCP must remain running with
+network access; this setting does not run uploads while the computer is off.
+Separate research/SLURM relay scripts are not started by this desktop toggle.
+
 ### Runtime requirements
 
 - Windows PowerShell 5.1 or PowerShell 7.

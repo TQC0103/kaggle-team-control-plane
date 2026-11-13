@@ -28,7 +28,7 @@ def _account_cli(service, account_id, *, max_text_chars=8000):
 
     def run(args, timeout=120):
         try:
-            output = service.adapter._run(args, env, threading.Event(), timeout_seconds=timeout)
+            output = service.adapter._run(args, env, getattr(service, '_recovery_stop', None) or threading.Event(), timeout_seconds=timeout)
         except Exception as exc:
             raise ValidationError(service.scheduler._redact(str(exc), env)[:1500]) from None
         if max_text_chars == 8000:

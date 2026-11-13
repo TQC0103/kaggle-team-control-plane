@@ -44,7 +44,7 @@ yarn-error.log*
 /control_plane/_build.py
 
 # generated Kaggle workload bundles (source snapshots, datasets, and revisions)
-/experiments/*/
+/experiments/*
 !/experiments/kaggle-smoke-test/
 !/experiments/kaggle-smoke-test/**
 /diagnostics/

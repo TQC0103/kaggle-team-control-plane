@@ -29,6 +29,16 @@ def _schema(properties: dict[str, Any] | None = None, required: list[str] | None
 
 TOOLS = [
     {
+        'name': 'kcp_artifact_archive',
+        'description': 'Read the persistent automatic private artifact archive queue, enabled setting, active workers, per-run/part verification and restart blockers. No mutation.',
+        'inputSchema': _schema(),
+    },
+    {
+        'name': 'kcp_configure_artifact_archive',
+        'description': 'Configure automatic private backup of every future completed run and optionally include existing job IDs. Requires user authorization; persists across app restarts. No local deletion or GPU submission.',
+        'inputSchema': _schema({'enabled': {'type':'boolean'}, 'include_job_ids': {'type':'array','items':{'type':'string'}}, 'account_ids': {'type':'array','items':{'type':'string'}}}),
+    },
+    {
         'name': 'kcp_dataset_library',
         'description': 'List cached owned Kaggle datasets across accounts, sizes, upload/readback verification, local-copy removal and deletion states. No remote mutation.',
         'inputSchema': _schema(),
@@ -201,6 +211,13 @@ def _request(path: str, method: str = "GET", body: Any | None = None, timeout: f
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read()
             headers = {key.lower(): value for key, value in response.headers.items()}
+    except urllib.error.HTTPError as exc:
+        raw_error = exc.read(8192)
+        try:
+            message = json.loads(raw_error).get("error", {}).get("message", str(exc.reason))
+        except (ValueError, AttributeError):
+            message = str(exc.reason)
+        raise RuntimeError(f"Kaggle Control Plane HTTP {exc.code}: {str(message)[:1000]}") from exc
     except (urllib.error.URLError, TimeoutError) as exc:
         raise RuntimeError(
             "Kaggle Control Plane API is offline. Open the desktop app with kcp_open_app, wait for startup, and retry."
@@ -290,6 +307,12 @@ def _download(path: str, destination_dir: str, fallback_name: str) -> dict[str, 
 
 
 def _call(name: str, arguments: dict[str, Any]) -> Any:
+    if name == 'kcp_artifact_archive':
+        payload, _ = _request('/api/artifacts/archive')
+        return _safe(payload)
+    if name == 'kcp_configure_artifact_archive':
+        payload, _ = _request('/api/artifacts/archive/config', 'POST', arguments)
+        return _safe(payload)
     if name == 'kcp_dataset_library':
         payload, _ = _request('/api/datasets/library')
         return _safe(payload)

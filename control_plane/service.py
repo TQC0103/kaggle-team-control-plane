@@ -32,6 +32,7 @@ from .scheduler import JobScheduler
 from .version import build_identity
 from .datasets import DatasetManager
 from .dataset_library import DatasetLibrary
+from .artifact_archive import ArtifactArchiver
 from .execution_profiles import GPU_SHAPES, validate_profile
 
 
@@ -110,6 +111,10 @@ class ControlPlaneService:
         self.adapter = adapter
         self.datasets = DatasetManager(self)
         self.dataset_library = DatasetLibrary(self)
+        self._output_lock_guard = threading.Lock()
+        self._output_locks: dict[str, threading.Lock] = {}
+        self._output_cache: dict[str, dict[str, Any]] = {}
+        self.artifact_archive = ArtifactArchiver(self)
         self._recovery_stop = threading.Event()
         # Recovery keeps checking a remotely active kernel after a desktop
         # restart.  Retain its last observed state in memory so a long Kaggle
@@ -135,6 +140,7 @@ class ControlPlaneService:
         )
         if start_scheduler:
             self.scheduler.start()
+            self.artifact_archive.start()
             # A Kaggle CLI status command can be slow or temporarily blocked.
             # Never make the desktop API/UI wait for that remote round trip.
             # The preserved active state is already safe, and the scheduler
@@ -160,9 +166,34 @@ class ControlPlaneService:
 
     def close(self) -> None:
         self._recovery_stop.set()
+        self.artifact_archive.close()
         self.datasets.close()
         self.dataset_library.close()
         self.scheduler.close()
+
+    def _collect_job_output(self, job, env, cancel_event):
+        """Share completed downloads between startup recovery and auto-archive.
+
+        A startup thread may still be fetching when the archive discovers a
+        terminal job. Never extract two output downloads into the same folder.
+        """
+        with self._output_lock_guard:
+            lock = self._output_locks.setdefault(job['id'], threading.Lock())
+        with lock:
+            current = self.database.get_job(job['id'], event_limit=0)
+            result = current.get('result') or {}
+            candidates = [self._output_cache.get(job['id'])]
+            if not result.get('output_pending'):
+                candidates.append(result.get('output'))
+            for output in candidates:
+                if not isinstance(output, dict) or not output.get('output_dir'):
+                    continue
+                directory = Path(output['output_dir'])
+                if directory.is_dir() and all((directory / f).is_file() for f in output.get('files', []) if isinstance(f, str)):
+                    return output
+            output = self.adapter.output(job, env, getattr(self, '_recovery_stop', cancel_event))
+            self._output_cache[job['id']] = output
+            return output
 
     def _schedule_recovered_job_recheck(self, job_id: str) -> None:
         """Keep reconciling a remote run even if startup had no network.
@@ -247,13 +278,26 @@ class ControlPlaneService:
                     "submitting", "submitted", "running", "cancel_requested",
                     "succeeded", "failed", "cancelled",
                 }
+                receipt = (job.get("result") or {}).get("submit") or {}
+                exact_receipt = (
+                    receipt.get("kernel_slug") == job["kernel_slug"]
+                    and job["kernel_slug"].split("/", 1)[0].casefold()
+                    == account["kaggle_username"].casefold()
+                    and type(receipt.get("version_number")) is int
+                    and receipt["version_number"] > 0
+                    and bool(receipt.get("remote_verification"))
+                )
                 if remote.state == "running":
                     self.database.transition_job(
                         job_id,
                         active_states,
                         "cancel_requested" if job.get("cancel_requested") else "running",
-                        fields={"error": None, "remote_may_be_running": 1},
+                        fields={"error": None, "remote_may_be_running": int(not exact_receipt)},
                     )
+                    # The scheduler counts the active DB row even though no
+                    # local training/monitor future survived app shutdown.
+                    # Only known exact-version sessions cease being uncertain.
+                    self.scheduler.wake()
                     self._schedule_recovered_job_recheck(job_id)
                 elif remote.state == "complete":
                     # Remote status is authoritative. Persist it before
@@ -266,27 +310,28 @@ class ControlPlaneService:
                         fields={
                             "error": None,
                             "remote_may_be_running": 0,
-                            "result": {
+                            "result": dict(job.get("result") or {}, **{
                                 "recovered_after_restart": True,
                                 "remote_status": safe_detail,
                                 "output_pending": True,
-                            },
+                            }),
                         },
                     )
                     try:
                         output = self.scheduler._redact(
-                            self.adapter.output(job, env, threading.Event()), env
+                            self._collect_job_output(job, env, threading.Event()), env
                         )
                         self.database.transition_job(
                             job_id,
                             {"succeeded"},
                             "succeeded",
                             fields={
-                                "result": {
+                                "result": dict(job.get("result") or {}, **{
                                     "recovered_after_restart": True,
                                     "remote_status": safe_detail,
                                     "output": output,
-                                }
+                                    "output_pending": False,
+                                })
                             },
                         )
                     except Exception as exc:
@@ -326,11 +371,11 @@ class ControlPlaneService:
                         fields={
                             "error": safe_detail or "Kaggle reported failure",
                             "remote_may_be_running": 0,
-                            "result": {
+                            "result": dict(job.get("result") or {}, **{
                                 "recovered_after_restart": True,
                                 "remote_status": safe_detail,
                                 "diagnostics_pending": True,
-                            },
+                            }),
                         },
                     )
                     terminal_log_lines = 0
@@ -347,11 +392,12 @@ class ControlPlaneService:
                             {"failed"},
                             "failed",
                             fields={
-                                "result": {
+                                "result": dict(job.get("result") or {}, **{
                                     "recovered_after_restart": True,
                                     "remote_status": safe_detail,
                                     "failure_output": failure_output,
-                                }
+                                    "diagnostics_pending": False,
+                                })
                             },
                         )
                         if terminal_log_lines:
@@ -394,10 +440,13 @@ class ControlPlaneService:
                         job_id,
                         active_states,
                         "cancel_requested" if job.get("cancel_requested") else "submitted",
-                        fields={"error": None, "remote_may_be_running": 1},
+                        fields={"error": None, "remote_may_be_running": int(not exact_receipt)},
                     )
+                    self.scheduler.wake()
                     self._schedule_recovered_job_recheck(job_id)
                 else:
+                    self.database.transition_job(job_id, active_states, job["status"],
+                                                 fields={"remote_may_be_running": 1})
                     self.database.append_job_event(
                         job_id,
                         "Kaggle returned an unrecognised state after restart; keeping job active",
@@ -406,6 +455,12 @@ class ControlPlaneService:
                     )
                     self._schedule_recovered_job_recheck(job_id)
             except Exception as exc:
+                # A previous successful query is not evidence that a current
+                # transport/auth failure is safe to ignore for admission.
+                current = self.database.get_job(job_id)
+                if current["status"] in {"submitting", "submitted", "running", "cancel_requested"}:
+                    self.database.transition_job(job_id, {current["status"]}, current["status"],
+                                                 fields={"remote_may_be_running": 1})
                 if self._should_report_recovery_observation(
                     job_id, "error", announce_restart=announce_restart
                 ):
@@ -1023,7 +1078,7 @@ class ControlPlaneService:
                 },
             )
         elif remote.state == "complete":
-            output = self.adapter.output(job, env, threading.Event())
+            output = self._collect_job_output(job, env, threading.Event())
             safe_output = self.scheduler._redact(output, env)
             result["output"] = safe_output
             # An on-demand status check can be the first successful query after

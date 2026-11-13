@@ -50,6 +50,8 @@ class DatasetTests(unittest.TestCase):
             if self.failure:
                 return self.failure
             self.remote.update(json.loads((Path(args[args.index("-p") + 1]) / "dataset-metadata.json").read_text()))
+            if self.visibility_mismatch:
+                self.remote["isPrivate"] = not self.remote["isPrivate"]
             return "Dataset created"
         if args[:2] == ["datasets", "metadata"]:
             directory = Path(args[args.index("-p") + 1])
@@ -95,6 +97,21 @@ class DatasetTests(unittest.TestCase):
         self.assertTrue(self.remote["isPrivate"])
         self.assertNotIn("--public", self.calls[0])
         self.assertEqual((self.source / "checkpoint.pth").read_bytes(), b"test data")
+
+    def test_create_without_readers_skips_redundant_mutation_but_verifies_privacy(self):
+        result = self.wait(self.manager.submit(self.payload(readers=[]), "test"))
+        self.assertEqual(result['status'], 'succeeded', result)
+        self.assertFalse(result['metadata_update_required'])
+        self.assertFalse(any('--update' in c for c in self.calls))
+        self.assertTrue(any(c[:2] == ['datasets','metadata'] for c in self.calls))
+        self.assertTrue(result['visibility_verified'])
+        self.assertTrue(result['readers_verified'])
+
+    def test_create_with_readers_still_requires_permission_update(self):
+        result = self.wait(self.manager.submit(self.payload(readers=['friend01']), 'test'))
+        self.assertEqual(result['status'], 'succeeded', result)
+        self.assertTrue(result['metadata_update_required'])
+        self.assertTrue(any('--update' in c for c in self.calls))
 
     def test_public_requires_explicit_confirmation_and_correct_flag(self):
         with self.assertRaises(ValidationError):

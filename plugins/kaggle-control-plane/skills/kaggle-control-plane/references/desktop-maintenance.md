@@ -21,6 +21,13 @@ task to load the refreshed skill/tools.
 
 ## Startup and Not Responding triage
 
+The installed app offers **Local app settings → Start with Windows**. It uses
+the current user's Windows Run entry, needs no administrator rights, and starts
+at sign-in rather than before login. With automatic artifact backup enabled,
+opening the app resumes the durable queue. It does not start separate SLURM
+relay scripts or transfer files while the computer is off. A session-local
+mutex prevents a second desktop launch from starting duplicate workers.
+
 1. Check the exact installed process path, ports, and bounded requests to
    `/api/health`, `/api/accounts`, and `/api/jobs`. `Responding=false` alone is
    insufficient; API responsiveness is the stronger signal.

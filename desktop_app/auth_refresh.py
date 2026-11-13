@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import threading
 import time
 from typing import Callable
@@ -106,6 +107,42 @@ class DesktopAuthRefresh:
                 self.ensure(ref)
             except ValidationError:
                 continue
+
+    def send_cloud_snapshot(self, bindings, consumer):
+        """Send an explicitly selected snapshot directly to a private cloud sink.
+
+        No refresh/save/env update: a maintenance subprocess must not race the
+        live desktop refresh writer. Credentials stay in this call's memory.
+        Consumer returns public receipt metadata only, never the payload.
+        """
+        items = []
+        for binding in bindings:
+            ref, username = binding["ref"], binding["username"]
+            with self._lock(ref):
+                stored = self.store.load(ref)
+                oauth = parse_oauth_bundle(stored)
+                if oauth:
+                    if oauth["username"] != username:
+                        raise ValueError("stored OAuth account mismatch")
+                    item = dict(kind="kaggle_oauth_v1", auth=oauth)
+                else:
+                    try:
+                        value = json.loads(stored)
+                    except (TypeError, json.JSONDecodeError):
+                        value = {"token": stored}
+                    allowed = {"token", "key", "username", "KAGGLE_API_TOKEN", "KAGGLE_KEY", "KAGGLE_USERNAME"}
+                    if not isinstance(value, dict) or set(value)-allowed:
+                        raise ValueError("unsupported static credential")
+                    if not any(value.get(k) for k in ["token", "key", "KAGGLE_API_TOKEN", "KAGGLE_KEY"]):
+                        raise ValueError("missing static credential")
+                    if value.get("username", value.get("KAGGLE_USERNAME", username)) != username:
+                        raise ValueError("static account mismatch")
+                    item = dict(kind="kaggle_static_v1", auth=value)
+                items.append(dict(id=binding["id"], username=username, **item))
+        try:
+            return consumer(items)
+        finally:
+            items.clear()
 
     def start(self, interval=60.0) -> None:
         if self._thread and self._thread.is_alive():

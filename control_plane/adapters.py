@@ -351,7 +351,17 @@ class KaggleCliAdapter:
             )
             while process.poll() is None:
                 if cancel_event.wait(self.command_poll_seconds):
-                    process.terminate()
+                    if os.name == 'nt':
+                        # The launcher has a Python child. Cancel only this
+                        # local CLI tree on app exit, not the remote kernel.
+                        try:
+                            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                           timeout=3, check=False, **hidden_subprocess_kwargs())
+                        except (OSError, subprocess.TimeoutExpired):
+                            process.terminate()
+                    else:
+                        process.terminate()
                     try:
                         process.wait(timeout=2)
                     except subprocess.TimeoutExpired:
@@ -599,8 +609,15 @@ class KaggleCliAdapter:
         status_ref = job["kernel_slug"]
         cancellation = (job.get("result") or {}).get("cancellation") or {}
         resolution = cancellation.get("resolution") or {}
+        receipt = (job.get("result") or {}).get("submit") or {}
         if job.get("cancel_requested") and resolution.get("version_number"):
             status_ref += "/" + str(resolution["version_number"])
+        elif (receipt.get("kernel_slug") == status_ref
+              and type(receipt.get("version_number")) is int
+              and receipt["version_number"] > 0):
+            # Recovery must query the accepted version, not a later notebook
+            # push that happens to reuse its owner/slug.
+            status_ref += "/" + str(receipt["version_number"])
         output = self._run(
             ["kernels", "status", status_ref],
             env,
@@ -696,6 +713,16 @@ class KaggleCliAdapter:
         self, env: dict[str, str], cancel_event: threading.Event
     ) -> dict[str, Any]:
         output = self._run(["quota", "--format", "json"], env, cancel_event)
+        # The official CLI can emit its API-version warning before valid JSON.
+        # _run merges stderr into stdout, so strip only this known whole-line
+        # notice. Auth errors, arbitrary prefixes and trailing junk still fail.
+        output = re.sub(
+            r"\A(?:Warning: Looks like you're using an outdated (?:API Version[^\r\n]*|"
+            r"`kaggle` version \(installed: [0-9A-Za-z.+_-]+\), please consider upgrading "
+            r"to the latest version \([0-9A-Za-z.+_-]+\))\r?\n(?:\r?\n)*)+",
+            "",
+            output.lstrip("\ufeff"),
+        )
         try:
             rows = json.loads(output)
         except json.JSONDecodeError as exc:

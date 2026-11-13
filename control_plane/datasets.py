@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,7 +49,7 @@ class DatasetManager:
         for path in self.root.glob("operation-*.json"):
             record = json.loads(path.read_text(encoding="utf-8"))
             if record["status"] not in _TERMINAL:
-                record.update(status="interrupted", phase="Review remote state before submitting again",
+                record.update(interrupted_phase=record.get('phase'), status="interrupted", phase="Review remote state before submitting again",
                               error="App stopped during this operation; it was not replayed automatically.", updated_at=_now())
                 self._save(record)
             self._operations[record["id"]] = record
@@ -61,7 +62,12 @@ class DatasetManager:
         path = self.root / f"operation-{record['id']}.json"
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        deadline=time.monotonic()+5
+        while True:
+            try:temporary.replace(path);break
+            except PermissionError:
+                if time.monotonic()>=deadline:raise
+                time.sleep(.05)
 
     def _update(self, operation_id, **changes):
         with self._lock:
@@ -200,10 +206,29 @@ class DatasetManager:
                       "title": metadata["title"], "is_private": metadata["isPrivate"], "readers": [r["username"] for r in metadata["collaborators"]],
                       "status": "queued", "phase": "Preparing", "file_count": len(files), "bytes": sum(f["bytes"] for f in files),
                       "idempotency_key": key, "request_hash": request_hash, "created_at": _now(), "updated_at": _now()}
+            if kind == 'upload':
+                record['recovery_plan'] = {'metadata': metadata, 'files': files}
+                record['create_started'] = False
             self._operations[operation_id] = record
             self._save(record)
             threading.Thread(target=self._execute, args=(operation_id, metadata, files, actor), daemon=True,
                              name=f"kcp-dataset-{operation_id[:8]}").start()
+            return dict(record)
+
+    def resume_archive_upload(self, operation_id, *, absence_confirmed=False):
+        """Trusted archive worker only. Never replay an uncertain create without reconciliation."""
+        with self._lock:
+            record = self._operations[operation_id]
+            plan = record.get('recovery_plan')
+            if self._closed or record['status'] not in {'interrupted', 'failed'} or not plan:
+                raise ConflictError('Upload is active, closing, or has no durable recovery plan')
+            if record.get('create_started') is not False and not absence_confirmed:
+                raise ConflictError('Remote create may exist; reconcile before resuming')
+            if any(r['id'] != operation_id and r['account_id'] == record['account_id'] and r['status'] not in _TERMINAL for r in self._operations.values()):
+                raise ConflictError('Another dataset operation owns this account')
+            record.update(status='queued', phase='Resuming persisted upload', error=None)
+            self._save(record)
+            threading.Thread(target=self._execute, args=(operation_id, plan['metadata'], plan['files'], 'archive-recovery'), daemon=True).start()
             return dict(record)
 
     def _remote_metadata(self, run, ref, directory):
@@ -274,17 +299,27 @@ class DatasetManager:
                             "isPrivate": private, "collaborators": readers + [r for r in old.get("collaborators", []) if r.get("role") != "READER"]}
             (directory / "dataset-metadata.json").write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
             if record["kind"] == "upload":
-                self._update(operation_id, phase="Uploading to Kaggle", files=hashes)
+                if self._closed:
+                    self._update(operation_id, status='interrupted', phase='Paused before remote create')
+                    return
+                self._update(operation_id, phase="Uploading to Kaggle", files=hashes, create_started=True)
                 args = ["datasets", "create", "-p", str(directory), "-q", "--dir-mode", "zip"]
                 if not metadata["isPrivate"]:
                     args.append("--public")
                 output = run(args, 3600)
                 if re.search(r"(?:creation error|\berror\b|\bfailed\b)", output, re.I):
                     raise ValidationError(output[:1500])
-            self._update(operation_id, phase="Applying visibility and reader permissions")
-            output = run(["datasets", "metadata", metadata["id"], "--update", "-p", str(directory)], 180)
-            if re.search(r"(?:update error|\berror\b|\bfailed\b)", output, re.I):
-                raise ValidationError(output[:1500])
+            # Create already applies visibility, title and license. With no
+            # readers there is nothing further to mutate; a redundant metadata
+            # RPC can403 after a successful private upload. Always verify the
+            # observed visibility/readers below; never infer them from create.
+            needs_update = record["kind"] == "settings" or bool(metadata["collaborators"])
+            self._update(operation_id, metadata_update_required=needs_update)
+            if needs_update:
+                self._update(operation_id, phase="Applying visibility and reader permissions")
+                output = run(["datasets", "metadata", metadata["id"], "--update", "-p", str(directory)], 180)
+                if re.search(r"(?:update error|\berror\b|\bfailed\b)", output, re.I):
+                    raise ValidationError(output[:1500])
             self._update(operation_id, phase="Verifying remote settings")
             remote = self._remote_metadata(run, metadata["id"], directory / "verified")
             if remote.get("isPrivate") is not metadata["isPrivate"]:

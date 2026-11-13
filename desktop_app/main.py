@@ -26,6 +26,7 @@ from control_plane.version import build_identity
 
 from .credential_store import WindowsCredentialStore
 from .auth_refresh import DesktopAuthRefresh
+from .startup import SingleInstance, get_startup, set_startup
 from .oauth import (
     parse_oauth_bundle,
     resolve_oauth_access_token,
@@ -169,7 +170,14 @@ class DesktopBridge:
             "credential_refs": self._runtime.credential_store.list_refs(),
             "data_root": str(self._runtime.data_root),
             "restart_required": self._runtime.restart_required,
+            "startup": get_startup(),
         }
+
+    def set_startup(self, enabled: bool) -> dict[str, Any]:
+        try:
+            return {"ok": True, "startup": set_startup(enabled)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     def save_credential(self, credential_ref: str, token: str) -> dict[str, Any]:
         try:
@@ -408,10 +416,14 @@ def main() -> int:
     parser.add_argument("--api-port", type=int, default=8765)
     parser.add_argument("--dashboard-port", type=int, default=3100)
     args = parser.parse_args()
-    runtime = DesktopRuntime(args.api_port, args.dashboard_port)
     if args.smoke:
-        return smoke_test(runtime)
+        return smoke_test(DesktopRuntime(args.api_port, args.dashboard_port))
+    instance = SingleInstance()
+    runtime = None
     try:
+        if not instance.acquire():
+            return 0
+        runtime = DesktopRuntime(args.api_port, args.dashboard_port)
         runtime.start()
         import webview
         bridge = DesktopBridge(runtime)
@@ -430,7 +442,11 @@ def main() -> int:
         message_box(str(exc), error=True)
         return 1
     finally:
-        runtime.stop()
+        try:
+            if runtime is not None:
+                runtime.stop()
+        finally:
+            instance.close()
 
 
 if __name__ == "__main__":

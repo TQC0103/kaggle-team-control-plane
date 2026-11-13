@@ -858,6 +858,15 @@ class Database:
             ).fetchall()
         return [self._decode(row, "job") for row in rows]  # type: ignore[misc]
 
+    def active_job_count(self, account_id: str) -> int:
+        """Include remote sessions recovered without a local worker future."""
+        with self.connection() as connection:
+            return int(connection.execute(
+                "SELECT COUNT(*) FROM jobs WHERE account_id=? AND status IN "
+                "('submitting','submitted','running','cancel_requested')",
+                (account_id,),
+            ).fetchone()[0])
+
     def transition_job(
         self,
         job_id: str,
